@@ -51,7 +51,7 @@ def file_exists_for_isbn(isbn: str, output_dir: str) -> str | None:
 # File download
 # ---------------------------------------------------------------------------
 
-@observe(name="download-file-attempts", capture_input=False, capture_output=False)
+@observe(name="download-file", capture_input=False, capture_output=False)
 def download_file(
     url: str,
     output_path: str,
@@ -68,6 +68,7 @@ def download_file(
         input={"url": url, "source": source, "max_retries": max_retries},
     )
     flush_tracing()
+    download_start = time.time()
 
     for attempt in range(max_retries):
         attempt_cm = langfuse.start_as_current_observation(
@@ -106,6 +107,7 @@ def download_file(
             total_size = int(resp.headers.get("content-length", 0))
             downloaded = 0
             last_report = time.time()
+            last_span_update = time.time()
             with open(output_path, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=65536):
                     f.write(chunk)
@@ -114,6 +116,20 @@ def download_file(
                     if progress_cb and now - last_report >= 10:
                         progress_cb(downloaded, total_size)
                         last_report = now
+                    # Live progress on the parent download-file span (every 30s)
+                    if now - last_span_update >= 30:
+                        elapsed = now - download_start
+                        speed = (downloaded / 1048576) / elapsed if elapsed > 0 else 0
+                        langfuse.update_current_span(
+                            metadata={
+                                "downloaded_mb": round(downloaded / 1048576, 2),
+                                "total_mb": round(total_size / 1048576, 2) if total_size else None,
+                                "speed_mbps": round(speed, 2),
+                                "elapsed_s": round(elapsed, 1),
+                            },
+                        )
+                        flush_tracing()
+                        last_span_update = now
 
             file_size = os.path.getsize(output_path)
             if file_size == 0:
@@ -141,7 +157,15 @@ def download_file(
             attempt_obs.update(output={"status_code": resp.status_code, "downloaded_bytes": downloaded, "total_bytes": total_size})
             attempt_cm.__exit__(None, None, None)
             flush_tracing()
-            langfuse.update_current_span(output={"success": True, "attempts": attempt + 1, "downloaded_bytes": downloaded})
+            elapsed = time.time() - download_start
+            speed = (file_size / 1048576) / elapsed if elapsed > 0 else 0
+            langfuse.update_current_span(output={
+                "success": True,
+                "attempts": attempt + 1,
+                "file_size_mb": round(file_size / 1048576, 2),
+                "duration_s": round(elapsed, 1),
+                "avg_speed_mbps": round(speed, 2),
+            })
             flush_tracing()
             return True, None
 
@@ -172,67 +196,17 @@ def download_file(
 # Per-ISBN download with candidate fallback
 # ---------------------------------------------------------------------------
 
-async def _do_download(isbn, url, candidate, output_dir, active, download_metrics):
-    """Download file, tracking progress in `active` dict. Returns (success, error)."""
+async def _do_download(isbn, url, candidate, output_dir, download_metrics):
+    """Download file. Returns (success, error)."""
     filename = make_output_filename(isbn, candidate)
     output_path = os.path.join(output_dir, filename)
 
-    active[isbn] = {
-        "title": candidate.title[:50],
-        "source": candidate.source,
-        "downloaded": 0,
-        "total": 0,
-    }
-
-    # Create a Langfuse observation for this download (Pattern B: thread-safe)
-    langfuse = get_client()
-    observation = langfuse.start_observation(
-        as_type="span",
-        name="download-file",
-        input={
-            "isbn": isbn,
-            "source": candidate.source,
-            "url": url,
-            "filename": filename,
-        },
-        trace_context={
-            "trace_id": langfuse.get_current_trace_id(),
-            "parent_span_id": langfuse.get_current_observation_id(),
-        },
-    )
-    flush_tracing()
-
-    download_start = time.time()
-    last_flush = time.time()
-
     def on_progress(downloaded, total, _isbn=isbn):
-        nonlocal last_flush
-        active[_isbn] = {
-            **active.get(_isbn, {}),
-            "downloaded": downloaded,
-            "total": total,
-        }
         mb = downloaded / 1048576
         if total:
             log(_isbn, f"{mb:.1f}/{total / 1048576:.1f} MB")
         else:
             log(_isbn, f"{mb:.1f} MB")
-
-        # Update Langfuse observation with live progress (flush every 30s)
-        now = time.time()
-        elapsed = now - download_start
-        speed_mbps = (downloaded / 1048576) / elapsed if elapsed > 0 else 0
-        observation.update(
-            metadata={
-                "downloaded_mb": round(downloaded / 1048576, 2),
-                "total_mb": round(total / 1048576, 2) if total else None,
-                "speed_mbps": round(speed_mbps, 2),
-                "elapsed_s": round(elapsed, 1),
-            },
-        )
-        if now - last_flush >= 30:
-            flush_tracing()
-            last_flush = now
 
     # Use max_retries=7 for Anna's Archive, 5 for others
     retries = 7 if candidate.source == "annas_archive" else 5
@@ -242,34 +216,13 @@ async def _do_download(isbn, url, candidate, output_dir, active, download_metric
         ctx.run, download_file, url, output_path, candidate.source, on_progress, retries,
     )
 
-    active.pop(isbn, None)
-
-    # Finalize the observation
-    elapsed = time.time() - download_start
     if success:
         file_size = os.path.getsize(output_path)
-        speed_mbps = (file_size / 1048576) / elapsed if elapsed > 0 else 0
         log(isbn, f"saved {filename} ({file_size:,} bytes)")
-        observation.update(
-            output={
-                "success": True,
-                "file_size_mb": round(file_size / 1048576, 2),
-                "duration_s": round(elapsed, 1),
-                "avg_speed_mbps": round(speed_mbps, 2),
-            },
-        )
         download_metrics["total_bytes"] += file_size
         download_metrics["completed"] += 1
     else:
-        observation.update(
-            output={"success": False, "error": error, "duration_s": round(elapsed, 1)},
-            level="ERROR",
-            status_message=error,
-        )
         download_metrics["failed"] += 1
-
-    observation.end()
-    flush_tracing()
 
     return success, error
 
@@ -281,7 +234,6 @@ async def download_one(
     sources: dict,
     output_dir: str,
     source_sems: dict,
-    active: dict,
     download_metrics: dict,
 ) -> tuple[str, BookResult | None]:
     """Download best match for isbn, trying candidates in ranked order."""
@@ -311,7 +263,7 @@ async def download_one(
                     log(isbn, f"{tag} no download link")
                     continue
                 success, error = await _do_download(
-                    isbn, url, candidate, output_dir, active, download_metrics,
+                    isbn, url, candidate, output_dir, download_metrics,
                 )
         else:
             url = candidate.download_url
@@ -321,7 +273,7 @@ async def download_one(
             sem = source_sems.get(candidate.source, asyncio.Semaphore(3))
             async with sem:
                 success, error = await _do_download(
-                    isbn, url, candidate, output_dir, active, download_metrics,
+                    isbn, url, candidate, output_dir, download_metrics,
                 )
 
         if success:

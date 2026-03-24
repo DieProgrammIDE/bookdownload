@@ -57,7 +57,6 @@ async def process_isbn(
     cache: diskcache.Cache,
     output_dir: str,
     source_sems: dict,
-    active: dict,
     download_metrics: dict,
     discovery_only: bool,
     download_only: bool,
@@ -112,7 +111,7 @@ async def process_isbn(
 
     log(isbn, f"[{idx}/{total}] {len(ranked)} candidate(s)")
     status, selected = await download_one(
-        isbn, ranked, sources, output_dir, source_sems, active, download_metrics,
+        isbn, ranked, sources, output_dir, source_sems, download_metrics,
     )
 
     langfuse.update_current_span(
@@ -168,7 +167,6 @@ async def run_pipeline(
     stats = {"downloaded": 0, "exists": 0, "not_found": 0, "failed": 0}
     stats_lock = threading.Lock()
     results_log: dict = {}
-    active: dict = {}
     download_metrics = {"total_bytes": 0, "completed": 0, "failed": 0}
 
     semaphore = asyncio.Semaphore(concurrency)
@@ -177,59 +175,14 @@ async def run_pipeline(
         async with semaphore:
             return await process_isbn(
                 isbn, idx, total, sources, cache, output_dir,
-                source_sems, active, download_metrics,
+                source_sems, download_metrics,
                 discovery_only, download_only,
             )
 
-    # Status reporter
-    start_time = asyncio.get_event_loop().time()
     phase_start = time.time()
 
-    async def status_reporter():
-        while True:
-            await asyncio.sleep(30)
-            elapsed = asyncio.get_event_loop().time() - start_time
-            done = sum(stats.values())
-            snapshot = dict(active)
-
-            total_mb = download_metrics["total_bytes"] / 1048576
-            wall_elapsed = time.time() - phase_start
-            avg_speed = total_mb / wall_elapsed if wall_elapsed > 0 else 0
-
-            print(
-                f"\n=== Status [{done}/{total}] {elapsed:.0f}s "
-                f"| downloaded: {stats['downloaded']} "
-                f"| failed: {stats['failed']} "
-                f"| not_found: {stats['not_found']} "
-                f"| {len(snapshot)} active ==="
-            )
-            for isbn, info in snapshot.items():
-                mb = info["downloaded"] / 1048576
-                total_mb_item = info["total"] / 1048576 if info["total"] else 0
-                title = info.get("title", "")
-                if total_mb_item:
-                    print(f"  [{isbn}] {mb:.1f}/{total_mb_item:.1f} MB — {title}")
-                elif mb:
-                    print(f"  [{isbn}] {mb:.1f} MB — {title}")
-                else:
-                    print(f"  [{isbn}] starting — {title}")
-
-            langfuse.update_current_span(
-                metadata={
-                    "total_mb_downloaded": round(total_mb, 2),
-                    "avg_speed_mbps": round(avg_speed, 3),
-                    "active_downloads": len(snapshot),
-                    "completed": download_metrics["completed"],
-                    "failed": download_metrics["failed"],
-                    "elapsed_s": round(wall_elapsed, 1),
-                },
-            )
-            flush_tracing()
-
-    reporter = asyncio.create_task(status_reporter())
     tasks = [bounded(isbn, i + 1) for i, isbn in enumerate(isbns)]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    reporter.cancel()
 
     for r in results:
         if isinstance(r, Exception):
