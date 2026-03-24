@@ -429,6 +429,8 @@ async def main():
     # Cleanup
     if "zlibrary" in sources:
         await sources["zlibrary"].close()
+    if "annas_archive" in sources:
+        sources["annas_archive"].close()
     cache.close()
 
 

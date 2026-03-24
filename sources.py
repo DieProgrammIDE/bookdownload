@@ -3,6 +3,7 @@
 import asyncio
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from urllib.parse import quote as url_quote
@@ -221,7 +222,12 @@ class ZLibrarySource:
 
 
 class AnnasArchiveSource:
-    """Anna's Archive backend using HTML scraping (ported from annas-mcp Go project)."""
+    """Anna's Archive backend using HTML scraping (ported from annas-mcp Go project).
+
+    Search uses requests + BeautifulSoup.
+    Download uses Playwright to bypass DDoS-Guard on slow_download pages,
+    extracts the direct file URL, then downloads with requests.
+    """
 
     BROWSER_UA = (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -229,10 +235,44 @@ class AnnasArchiveSource:
     )
     FORMAT_RE = re.compile(r"(?i)\b(EPUB|PDF|MOBI|AZW3|AZW|DJVU|CBZ|CBR|FB2|DOCX?|TXT)\b")
     SIZE_RE = re.compile(r"\d+\.?\d*\s*(MB|KB|GB|TB)", re.IGNORECASE)
-    SLOW_DOWNLOAD_SERVERS = 9  # servers 0-8
 
     def __init__(self, base_url: str = "annas-archive.gl"):
         self._base = base_url
+        self._pw = None
+        self._browser = None
+        self._lock = threading.Lock()
+        self._backoff_until = 0.0
+        self._backoff_seconds = 0
+
+    def _ensure_browser(self):
+        """Lazily launch Playwright browser (reused across downloads)."""
+        if self._browser is None:
+            from playwright.sync_api import sync_playwright
+            self._pw = sync_playwright().start()
+            self._browser = self._pw.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+
+    def _wait_for_backoff(self):
+        """Block until backoff period expires."""
+        now = time.time()
+        if now < self._backoff_until:
+            wait = self._backoff_until - now
+            print(f"  [Anna's Archive] Rate limited, waiting {wait:.0f}s...")
+            time.sleep(wait)
+
+    def _on_failure(self):
+        """Increase backoff exponentially (10s → 20s → 40s → ... → 120s cap)."""
+        with self._lock:
+            self._backoff_seconds = min(max(self._backoff_seconds * 2, 10), 120)
+            self._backoff_until = time.time() + self._backoff_seconds
+
+    def _on_success(self):
+        """Reset backoff on successful download."""
+        with self._lock:
+            self._backoff_seconds = 0
+            self._backoff_until = 0.0
 
     def _parse_meta(self, meta_text: str) -> tuple[str, str, str]:
         """Parse metadata string like '✅ German [de] · PDF · 9.0MB · 2017'."""
@@ -285,7 +325,6 @@ class AnnasArchiveSource:
         # Find cover image links (same selector as Go code)
         cover_links = soup.select('a[href^="/md5/"].custom-a')
         if not cover_links:
-            # Fallback: try matching the full class
             cover_links = [
                 a for a in soup.select('a[href^="/md5/"]')
                 if "custom-a" in (a.get("class") or [])
@@ -331,7 +370,8 @@ class AnnasArchiveSource:
             if not md5_hash:
                 continue
 
-            download_url = f"https://{self._base}/slow_download/{md5_hash}/0/0"
+            ext = fmt.lower() if fmt else ""
+            download_url = f"https://{self._base}/slow_download/{md5_hash}/0/5"
 
             results.append(BookResult(
                 isbn=isbn,
@@ -339,7 +379,7 @@ class AnnasArchiveSource:
                 authors=authors,
                 year="",
                 language=language.lower(),
-                extension=fmt.lower() if fmt else "",
+                extension=ext,
                 size=size,
                 download_url=download_url,
                 source="annas_archive",
@@ -348,23 +388,80 @@ class AnnasArchiveSource:
 
         return results
 
+    def _extract_download_url(self, md5_hash: str, extension: str) -> str | None:
+        """Use Playwright to visit slow_download page, bypass DDoS-Guard, extract direct URL.
+
+        Serialized via self._lock because Playwright's sync API is not thread-safe.
+        The actual file download happens outside the lock so multiple files can
+        download in parallel.
+        """
+        # Build regex to match direct download URLs containing the hash
+        ext_pattern = re.escape(extension) if extension else r"[a-z]+"
+        url_re = re.compile(
+            r'https?://[^\s"<>\']+' + re.escape(md5_hash) + r'[^\s"<>\']*\.' + ext_pattern
+        )
+
+        with self._lock:
+            self._ensure_browser()
+            context = self._browser.new_context(user_agent=self.BROWSER_UA)
+            page = context.new_page()
+
+            try:
+                for server_id in range(5, 9):
+                    self._wait_for_backoff()
+                    url = f"https://{self._base}/slow_download/{md5_hash}/0/{server_id}"
+                    print(f"  [Anna's Archive] Trying server {server_id}...")
+                    try:
+                        page.goto(url, timeout=30000)
+                        page.wait_for_function(
+                            "() => !document.body.innerText.includes('Checking your browser')",
+                            timeout=15000,
+                        )
+                        html = page.content()
+                        match = url_re.search(html)
+                        if match:
+                            direct_url = match.group(0)
+                            print(f"  [Anna's Archive] Got direct URL from server {server_id}")
+                            self._on_success()
+                            return direct_url
+                    except Exception as e:
+                        print(f"  [Anna's Archive] Server {server_id} failed: {e}")
+                        self._on_failure()
+                        continue
+            finally:
+                context.close()
+
+        return None
+
     def download(self, result: BookResult, output_path: str) -> bool:
         md5_hash = result.source_metadata.get("hash", "")
         if not md5_hash:
-            # Fall back to download_url directly
             if result.download_url:
                 return _download_file(result.download_url, output_path, source="Anna's Archive")
             print("  [Anna's Archive] No hash or download URL available")
             return False
 
-        for server_id in range(self.SLOW_DOWNLOAD_SERVERS):
-            url = f"https://{self._base}/slow_download/{md5_hash}/0/{server_id}"
-            print(f"  [Anna's Archive] Trying server {server_id}...")
-            if _download_file(url, output_path, source="Anna's Archive"):
-                return True
+        direct_url = self._extract_download_url(md5_hash, result.extension)
+        if not direct_url:
+            print("  [Anna's Archive] Could not extract download URL from any server")
+            return False
 
-        print("  [Anna's Archive] All download servers failed")
-        return False
+        return _download_file(direct_url, output_path, source="Anna's Archive")
+
+    def close(self):
+        """Shut down the Playwright browser."""
+        if self._browser:
+            try:
+                self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+        if self._pw:
+            try:
+                self._pw.stop()
+            except Exception:
+                pass
+            self._pw = None
 
 
 class InternetArchiveSource:
