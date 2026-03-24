@@ -1,0 +1,7 @@
+libgen-api-enhanced
+zlibrary
+requests
+aiohttp
+beautifulsoup4
+lxml
+python-dotenv
