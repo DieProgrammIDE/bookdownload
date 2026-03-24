@@ -11,6 +11,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from models import BROWSER_UA, BookResult
+from tracing import observe, get_client, flush_tracing
 
 FORMAT_RE = re.compile(r"(?i)\b(EPUB|PDF|MOBI|AZW3|AZW|DJVU|CBZ|CBR|FB2|DOCX?|TXT)\b")
 SIZE_RE = re.compile(r"\d+\.?\d*\s*(MB|KB|GB|TB)", re.IGNORECASE)
@@ -43,15 +44,59 @@ class AnnasArchiveSource:
     # Search (sync, uses requests + BeautifulSoup)
     # ------------------------------------------------------------------
 
+    @observe(name="search-annas-archive", capture_input=False, capture_output=False)
     def search_isbn(self, isbn: str) -> list[BookResult]:
+        langfuse = get_client()
+        langfuse.update_current_span(input={"isbn": isbn})
+
         search_url = f"https://{self._base}/search?q={url_quote(isbn)}&content=book_any"
-        try:
-            resp = requests.get(
-                search_url, headers={"User-Agent": BROWSER_UA}, timeout=30,
+        max_retries = 5
+        resp = None
+
+        for attempt in range(max_retries):
+            try:
+                resp = requests.get(
+                    search_url, headers={"User-Agent": BROWSER_UA}, timeout=30,
+                )
+                if resp.status_code in (429, 503):
+                    wait = min(15 * 2**attempt, 120)
+                    print(
+                        f"  [Anna's Archive] Rate limited "
+                        f"(attempt {attempt + 1}/{max_retries}), waiting {wait}s..."
+                    )
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                break  # success → parse HTML below
+            except requests.RequestException as e:
+                if attempt < max_retries - 1:
+                    wait = min(5 * 2**attempt, 120)
+                    print(
+                        f"  [Anna's Archive] Search error "
+                        f"(attempt {attempt + 1}/{max_retries}): {e}, "
+                        f"retrying in {wait}s..."
+                    )
+                    time.sleep(wait)
+                else:
+                    print(
+                        f"  [Anna's Archive] Search failed after "
+                        f"{max_retries} attempts: {e}"
+                    )
+                    langfuse.update_current_span(
+                        output={"result_count": 0, "retries": attempt + 1, "error": str(e)},
+                        level="ERROR",
+                        status_message=str(e),
+                    )
+                    flush_tracing()
+                    return []
+        else:
+            # All retries exhausted (rate limiting)
+            langfuse.update_current_span(
+                output={"result_count": 0, "retries": max_retries, "error": "rate limited"},
+                level="ERROR",
+                status_message="rate limited after all retries",
             )
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            print(f"  [Anna's Archive] Search error: {e}")
+            flush_tracing()
             return []
 
         soup = BeautifulSoup(resp.text, "lxml")
@@ -114,29 +159,54 @@ class AnnasArchiveSource:
                 source_metadata={"hash": md5_hash, "publisher": publisher},
             ))
 
+        langfuse.update_current_span(
+            output={"result_count": len(results), "retries": attempt + 1},
+        )
+        flush_tracing()
         return results
 
     # ------------------------------------------------------------------
     # URL extraction (sync Playwright, runs in dedicated thread)
     # ------------------------------------------------------------------
 
+    @observe(name="extract-url-annas", capture_input=False, capture_output=False)
     async def extract_url(self, md5_hash: str, start_server: int) -> str | None:
         """Submit extraction to the dedicated Playwright thread."""
+        langfuse = get_client()
+        langfuse.update_current_span(
+            input={"md5_hash": md5_hash, "start_server": start_server},
+        )
+
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
+        url = await loop.run_in_executor(
             self._executor, self._do_extract, md5_hash, start_server,
         )
 
+        langfuse.update_current_span(
+            output={"success": url is not None, "url_found": bool(url)},
+        )
+        flush_tracing()
+        return url
+
     def _do_extract(self, md5_hash: str, start_server: int) -> str | None:
-        """Try servers starting from start_server. Fully synchronous."""
+        """Try servers with up to 3 full passes. Fully synchronous."""
         self._ensure_browser()
         servers = [start_server] + [s for s in self.SERVERS if s != start_server]
-        for sid in servers:
-            self._wait_for_backoff()
-            url = self._try_server(md5_hash, sid)
-            if url:
-                self._on_success()
-                return url
+        max_passes = 3
+        for pass_num in range(max_passes):
+            if pass_num > 0:
+                wait = min(10 * 2**pass_num, 60)
+                print(
+                    f"  [Anna's Archive] Extraction pass "
+                    f"{pass_num + 1}/{max_passes}, waiting {wait}s..."
+                )
+                time.sleep(wait)
+            for sid in servers:
+                self._wait_for_backoff()
+                url = self._try_server(md5_hash, sid)
+                if url:
+                    self._on_success()
+                    return url
         return None
 
     def _try_server(self, md5_hash: str, server_id: int) -> str | None:
@@ -189,7 +259,7 @@ class AnnasArchiveSource:
             time.sleep(wait)
 
     def _on_failure(self):
-        self._backoff_seconds = min(max(self._backoff_seconds * 2, 10), 120)
+        self._backoff_seconds = min(max(self._backoff_seconds * 2, 10), 300)
         self._backoff_until = time.time() + self._backoff_seconds
 
     def _on_success(self):

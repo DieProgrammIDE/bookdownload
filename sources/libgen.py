@@ -1,6 +1,7 @@
 """LibGen search backend using libgen-api-enhanced."""
 
 from models import BookResult
+from tracing import observe, get_client, flush_tracing
 
 
 class LibGenSource:
@@ -9,7 +10,10 @@ class LibGenSource:
         from libgen_api_enhanced import LibgenSearch
         self._searcher = LibgenSearch(mirror=mirror)
 
+    @observe(name="search-libgen", capture_input=False, capture_output=False)
     def search_isbn(self, isbn: str) -> list[BookResult]:
+        langfuse = get_client()
+        langfuse.update_current_span(input={"isbn": isbn})
         try:
             results = self._searcher.search_default(isbn)
         except Exception as e:
@@ -39,4 +43,6 @@ class LibGenSource:
                 download_url=download_url,
                 source="libgen",
             ))
+        langfuse.update_current_span(output={"result_count": len(books)})
+        flush_tracing()
         return books

@@ -3,6 +3,7 @@
 import asyncio
 
 from models import BookResult
+from tracing import observe, get_client, flush_tracing
 
 
 class ZLibrarySource:
@@ -33,7 +34,10 @@ class ZLibrarySource:
         except Exception:
             return None
 
+    @observe(name="search-zlibrary", capture_input=False, capture_output=False)
     async def search_isbn(self, isbn: str) -> list[BookResult]:
+        langfuse = get_client()
+        langfuse.update_current_span(input={"isbn": isbn})
         async with self._lock:
             try:
                 await self._ensure_login()
@@ -96,6 +100,8 @@ class ZLibrarySource:
                     source="zlibrary",
                 ))
 
+            langfuse.update_current_span(output={"result_count": len(results)})
+            flush_tracing()
             return results
 
     async def close(self):

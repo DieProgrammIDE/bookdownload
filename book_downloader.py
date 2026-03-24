@@ -14,9 +14,10 @@ from dotenv import load_dotenv
 
 logging.getLogger("libgen_api_enhanced").setLevel(logging.ERROR)
 
-from discovery import run_discovery_phase
-from downloader import run_download_phase
-from sources import AnnasArchiveSource, InternetArchiveSource, LibGenSource, ZLibrarySource
+from tracing import observe, get_client, flush_tracing  # noqa: E402
+from discovery import run_discovery_phase  # noqa: E402
+from downloader import run_download_phase  # noqa: E402
+from sources import AnnasArchiveSource, InternetArchiveSource, LibGenSource, ZLibrarySource  # noqa: E402
 
 
 def load_isbns(filepath: str) -> list[str]:
@@ -38,7 +39,10 @@ def load_isbns(filepath: str) -> list[str]:
     return isbns
 
 
+@observe(name="book-downloader-session", capture_input=False, capture_output=False)
 async def main():
+    langfuse = get_client()
+
     parser = argparse.ArgumentParser(
         description="Download books by ISBN from shadow libraries"
     )
@@ -152,88 +156,114 @@ async def main():
         print("Error: No sources available.")
         sys.exit(1)
 
-    # ------------------------------------------------------------------
-    # Phase 1: Discovery
-    # ------------------------------------------------------------------
-    if not args.download_only:
-        print(f"\n{'=' * 60}")
-        print(
-            f"Phase 1: Discovery  "
-            f"[{len(isbns)} ISBNs, concurrency={args.discovery_concurrency}]"
-        )
-        print(f"{'=' * 60}")
-        await run_discovery_phase(isbns, sources, cache, args.discovery_concurrency)
+    # Update session span with metadata
+    langfuse.update_current_span(
+        input={
+            "isbn_count": len(isbns),
+            "sources": list(sources.keys()),
+            "output_dir": args.output_dir,
+            "discovery_only": args.discovery_only,
+            "download_only": args.download_only,
+        },
+    )
+    flush_tracing()
 
-    # Save discovery metadata
-    discovery_data = {}
-    for isbn in isbns:
-        cached = cache.get(f"discovery:{isbn}")
-        discovery_data[isbn] = {"candidates": cached if cached is not None else []}
-    discovery_path = os.path.join(args.output_dir, "discovery.json")
-    with open(discovery_path, "w") as f:
-        json.dump(discovery_data, f, indent=2, ensure_ascii=False)
-    print(f"\nDiscovery metadata written to {discovery_path}")
-
-    # ------------------------------------------------------------------
-    # Phase 2: Download
-    # ------------------------------------------------------------------
-    stats = {}
-    results_log = {}
-    if not args.discovery_only:
-        print(f"\n{'=' * 60}")
-        print(f"Phase 2: Download")
-        print(f"{'=' * 60}")
-        stats, results_log = await run_download_phase(
-            isbns, sources, cache, args.output_dir, args.host_concurrency,
-        )
-
-        not_found = [
-            isbn for isbn, info in results_log.items()
-            if info["status"] == "not_found"
-        ]
-        failed = [
-            isbn for isbn, info in results_log.items()
-            if info["status"] == "failed"
-        ]
-
-        print(f"\n{'=' * 60}")
-        print("Summary:")
-        print(f"  Downloaded:      {stats.get('downloaded', 0)}")
-        print(f"  Already existed: {stats.get('exists', 0)}")
-        print(f"  Not found:       {stats.get('not_found', 0)}")
-        print(f"  Failed:          {stats.get('failed', 0)}")
-        print(f"  Total:           {len(isbns)}")
-
-        if not_found:
-            print(f"\nNot found ({len(not_found)}):")
-            for isbn in not_found:
-                print(f"  {isbn}")
-        if failed:
-            print(f"\nFailed ({len(failed)}):")
-            for isbn in failed:
-                print(f"  {isbn}")
-
-        results_path = os.path.join(args.output_dir, "results.json")
-        with open(results_path, "w") as f:
-            json.dump(
-                {
-                    "stats": stats,
-                    "results": results_log,
-                    "not_found": not_found,
-                    "failed": failed,
-                },
-                f, indent=2, ensure_ascii=False,
+    try:
+        # ------------------------------------------------------------------
+        # Phase 1: Discovery
+        # ------------------------------------------------------------------
+        if not args.download_only:
+            print(f"\n{'=' * 60}")
+            print(
+                f"Phase 1: Discovery  "
+                f"[{len(isbns)} ISBNs, concurrency={args.discovery_concurrency}]"
             )
-        print(f"\nResults written to {results_path}")
+            print(f"{'=' * 60}")
+            await run_discovery_phase(isbns, sources, cache, args.discovery_concurrency)
+            flush_tracing()
 
-    # ------------------------------------------------------------------
-    # Cleanup
-    # ------------------------------------------------------------------
-    if "zlibrary" in sources:
-        await sources["zlibrary"].close()
-    if "annas_archive" in sources:
-        sources["annas_archive"].close()
-    cache.close()
+        # Save discovery metadata
+        discovery_data = {}
+        for isbn in isbns:
+            cached = cache.get(f"discovery:{isbn}")
+            discovery_data[isbn] = {"candidates": cached if cached is not None else []}
+        discovery_path = os.path.join(args.output_dir, "discovery.json")
+        with open(discovery_path, "w") as f:
+            json.dump(discovery_data, f, indent=2, ensure_ascii=False)
+        print(f"\nDiscovery metadata written to {discovery_path}")
+
+        # ------------------------------------------------------------------
+        # Phase 2: Download
+        # ------------------------------------------------------------------
+        stats = {}
+        results_log = {}
+        if not args.discovery_only:
+            print(f"\n{'=' * 60}")
+            print(f"Phase 2: Download")
+            print(f"{'=' * 60}")
+            stats, results_log = await run_download_phase(
+                isbns, sources, cache, args.output_dir, args.host_concurrency,
+            )
+            flush_tracing()
+
+            not_found = [
+                isbn for isbn, info in results_log.items()
+                if info["status"] == "not_found"
+            ]
+            failed = [
+                isbn for isbn, info in results_log.items()
+                if info["status"] == "failed"
+            ]
+
+            print(f"\n{'=' * 60}")
+            print("Summary:")
+            print(f"  Downloaded:      {stats.get('downloaded', 0)}")
+            print(f"  Already existed: {stats.get('exists', 0)}")
+            print(f"  Not found:       {stats.get('not_found', 0)}")
+            print(f"  Failed:          {stats.get('failed', 0)}")
+            print(f"  Total:           {len(isbns)}")
+
+            if not_found:
+                print(f"\nNot found ({len(not_found)}):")
+                for isbn in not_found:
+                    print(f"  {isbn}")
+            if failed:
+                print(f"\nFailed ({len(failed)}):")
+                for isbn in failed:
+                    print(f"  {isbn}")
+
+            results_path = os.path.join(args.output_dir, "results.json")
+            with open(results_path, "w") as f:
+                json.dump(
+                    {
+                        "stats": stats,
+                        "results": results_log,
+                        "not_found": not_found,
+                        "failed": failed,
+                    },
+                    f, indent=2, ensure_ascii=False,
+                )
+            print(f"\nResults written to {results_path}")
+
+            # Update session span with final stats
+            langfuse.update_current_span(
+                output={
+                    "stats": stats,
+                    "not_found_count": len(not_found),
+                    "failed_count": len(failed),
+                },
+            )
+
+    finally:
+        # ------------------------------------------------------------------
+        # Cleanup
+        # ------------------------------------------------------------------
+        if "zlibrary" in sources:
+            await sources["zlibrary"].close()
+        if "annas_archive" in sources:
+            sources["annas_archive"].close()
+        cache.close()
+        flush_tracing()
 
 
 if __name__ == "__main__":

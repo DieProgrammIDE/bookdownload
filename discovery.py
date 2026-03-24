@@ -1,6 +1,7 @@
 """Phase 1: Discovery — search all sources for each ISBN."""
 
 import asyncio
+import contextvars
 import os
 from collections import defaultdict
 
@@ -8,6 +9,7 @@ import diskcache
 
 from models import BookResult
 from sources.zlibrary import ZLibrarySource
+from tracing import observe, get_client, flush_tracing
 
 
 def _format_source_summary(books: list[BookResult]) -> str:
@@ -35,6 +37,7 @@ def _file_exists_for_isbn(isbn: str, output_dir: str) -> str | None:
     return None
 
 
+@observe(name="discover-isbn", capture_input=False, capture_output=False)
 async def discover_isbn(
     isbn: str,
     sources: dict,
@@ -44,6 +47,9 @@ async def discover_isbn(
 
     Returns (candidates, log_lines) — caller prints log_lines atomically.
     """
+    langfuse = get_client()
+    langfuse.update_current_span(input={"isbn": isbn, "sources": list(sources.keys())})
+
     log: list[str] = []
     cache_key = f"discovery:{isbn}"
 
@@ -51,18 +57,27 @@ async def discover_isbn(
     if cached is not None:
         candidates = [BookResult.from_dict(d) for d in cached]
         log.append(f"  [cache] {len(candidates)} candidate(s)")
+        langfuse.update_current_span(
+            output={"candidate_count": len(candidates), "from_cache": True},
+        )
+        flush_tracing()
         return candidates, log
 
     existing = _file_exists_for_isbn(isbn, cache.directory.replace("/.cache", ""))
     if existing:
         log.append(f"  [skip] Already on disk: {existing}")
+        langfuse.update_current_span(
+            output={"candidate_count": 0, "skipped": True, "reason": "on_disk"},
+        )
+        flush_tracing()
         return [], log
 
     candidates: list[BookResult] = []
 
     async def search_sync(name: str, source):
         try:
-            results = await asyncio.to_thread(source.search_isbn, isbn)
+            ctx = contextvars.copy_context()
+            results = await asyncio.to_thread(ctx.run, source.search_isbn, isbn)
             return name, results, None
         except Exception as e:
             return name, [], str(e)
@@ -83,6 +98,7 @@ async def discover_isbn(
 
     task_results = await asyncio.gather(*tasks, return_exceptions=True)
 
+    source_results = {}
     for r in task_results:
         if isinstance(r, Exception):
             log.append(f"  [error] {r}")
@@ -90,21 +106,43 @@ async def discover_isbn(
         name, books, error = r
         if error:
             log.append(f"  [{name}] Search error: {error}")
+            source_results[name] = {"count": 0, "error": error}
         else:
             log.append(f"  [{name}] {_format_source_summary(books)}")
+            source_results[name] = {"count": len(books)}
         if books:
             candidates.extend(books)
 
     cache.set(cache_key, [c.to_dict() for c in candidates])
+
+    langfuse.update_current_span(
+        output={
+            "candidate_count": len(candidates),
+            "from_cache": False,
+            "sources": source_results,
+        },
+    )
+    flush_tracing()
     return candidates, log
 
 
+@observe(name="discovery-phase", capture_input=False, capture_output=False)
 async def run_discovery_phase(
     isbns: list[str],
     sources: dict,
     cache: diskcache.Cache,
     concurrency: int,
 ) -> dict:
+    langfuse = get_client()
+    langfuse.update_current_span(
+        input={
+            "isbn_count": len(isbns),
+            "sources": list(sources.keys()),
+            "concurrency": concurrency,
+        },
+    )
+    flush_tracing()
+
     semaphore = asyncio.Semaphore(concurrency)
 
     async def bounded(isbn: str, idx: int, total: int):
@@ -124,4 +162,8 @@ async def run_discovery_phase(
     not_found = sum(1 for r in results if not isinstance(r, Exception) and not r[1])
     errors = sum(1 for r in results if isinstance(r, Exception))
     print(f"\nDiscovery: {found} found, {not_found} not found, {errors} errors")
-    return {"found": found, "not_found": not_found, "errors": errors}
+
+    summary = {"found": found, "not_found": not_found, "errors": errors}
+    langfuse.update_current_span(output=summary)
+    flush_tracing()
+    return summary
