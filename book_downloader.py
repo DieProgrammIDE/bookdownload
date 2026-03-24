@@ -266,6 +266,8 @@ async def main():
     parser.add_argument("isbn_file", help="Path to file with ISBNs (one per line)")
     parser.add_argument("-o", "--output-dir", default="downloads", help="Output directory (default: downloads/)")
     parser.add_argument("--libgen-mirror", default="li", help="LibGen mirror TLD: li, bz, gs (default: li)")
+    parser.add_argument("--annas-mirror", default="annas-archive.gl",
+                        help="Anna's Archive mirror domain (default: annas-archive.gl)")
     parser.add_argument("--any-format", action="store_true", help="Accept EPUB/DJVU if no PDF available")
 
     # Source toggles
@@ -321,8 +323,8 @@ async def main():
             print(f"Warning: LibGen init failed: {e}")
 
     if not args.no_annas:
-        sources["annas_archive"] = AnnasArchiveSource()
-        print("Anna's Archive initialized")
+        sources["annas_archive"] = AnnasArchiveSource(base_url=args.annas_mirror)
+        print(f"Anna's Archive initialized (mirror: {args.annas_mirror})")
 
     if not args.no_internet_archive:
         sources["internet_archive"] = InternetArchiveSource()

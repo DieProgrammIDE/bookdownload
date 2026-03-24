@@ -5,8 +5,10 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from urllib.parse import quote as url_quote
 
 import requests
+from bs4 import BeautifulSoup
 
 
 @dataclass
@@ -244,20 +246,149 @@ class ZLibrarySource:
 
 
 class AnnasArchiveSource:
-    """Anna's Archive backend.
+    """Anna's Archive backend using HTML scraping (ported from annas-mcp Go project)."""
 
-    NOTE: Anna's Archive currently serves a JavaScript-rendered SPA with bot
-    protection (JS redirect → 403 on direct requests). All scraping libraries
-    including annas-py return 0 results. This class is kept as a stub so the
-    architecture remains intact; it returns [] gracefully until a working
-    library becomes available.
-    """
+    BROWSER_UA = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+    FORMAT_RE = re.compile(r"(?i)\b(EPUB|PDF|MOBI|AZW3|AZW|DJVU|CBZ|CBR|FB2|DOCX?|TXT)\b")
+    SIZE_RE = re.compile(r"\d+\.?\d*\s*(MB|KB|GB|TB)", re.IGNORECASE)
+    SLOW_DOWNLOAD_SERVERS = 9  # servers 0-8
+
+    def __init__(self, base_url: str = "annas-archive.gl"):
+        self._base = base_url
+
+    def _parse_meta(self, meta_text: str) -> tuple[str, str, str]:
+        """Parse metadata string like '✅ German [de] · PDF · 9.0MB · 2017'."""
+        parts = meta_text.split(" · ")
+        if len(parts) < 3:
+            return "", "", ""
+
+        # Language: first part, strip ✅, take before [
+        lang_part = parts[0].strip()
+        language = ""
+        bracket_idx = lang_part.find("[")
+        if bracket_idx > 0:
+            language = lang_part[:bracket_idx].replace("✅", "").strip()
+        else:
+            language = lang_part.replace("✅", "").strip()
+
+        # Format and size from remaining parts
+        fmt = ""
+        size = ""
+        for part in parts[1:]:
+            part = part.strip()
+            if not fmt:
+                m = self.FORMAT_RE.search(part)
+                if m:
+                    fmt = m.group(1).upper()
+            if not size:
+                m = self.SIZE_RE.search(part)
+                if m:
+                    size = part.strip()
+            if fmt and size:
+                break
+
+        return language, fmt, size
 
     def search_isbn(self, isbn: str) -> list[BookResult]:
-        print("  [Anna's Archive] unavailable — site requires JS rendering (bot protection)")
-        return []
+        search_url = f"https://{self._base}/search?q={url_quote(isbn)}&content=book_any"
+        try:
+            resp = requests.get(
+                search_url,
+                headers={"User-Agent": self.BROWSER_UA},
+                timeout=30,
+            )
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            print(f"  [Anna's Archive] Search error: {e}")
+            return []
+
+        soup = BeautifulSoup(resp.text, "lxml")
+
+        # Find cover image links (same selector as Go code)
+        cover_links = soup.select('a[href^="/md5/"].custom-a')
+        if not cover_links:
+            # Fallback: try matching the full class
+            cover_links = [
+                a for a in soup.select('a[href^="/md5/"]')
+                if "custom-a" in (a.get("class") or [])
+            ]
+
+        results = []
+        for a_tag in cover_links:
+            parent = a_tag.parent
+            if parent is None:
+                continue
+
+            info_div = parent.select_one("div.max-w-full")
+            if info_div is None:
+                continue
+
+            # Title
+            title_el = info_div.select_one('a[href^="/md5/"]')
+            title = title_el.get_text(strip=True) if title_el else ""
+            if not title:
+                continue
+
+            # Authors
+            authors = ""
+            author_icon = info_div.select_one('a[href^="/search"] span.icon-\\[mdi--user-edit\\]')
+            if author_icon and author_icon.parent:
+                authors = author_icon.parent.get_text(strip=True)
+
+            # Publisher (stored in source_metadata)
+            publisher = ""
+            pub_icon = info_div.select_one('a[href^="/search"] span.icon-\\[mdi--company\\]')
+            if pub_icon and pub_icon.parent:
+                publisher = pub_icon.parent.get_text(strip=True)
+
+            # Metadata (language, format, size)
+            meta_div = info_div.select_one("div.text-gray-800")
+            language, fmt, size = "", "", ""
+            if meta_div:
+                language, fmt, size = self._parse_meta(meta_div.get_text())
+
+            # Hash from href
+            href = a_tag.get("href", "")
+            md5_hash = href.replace("/md5/", "") if href.startswith("/md5/") else ""
+            if not md5_hash:
+                continue
+
+            download_url = f"https://{self._base}/slow_download/{md5_hash}/0/0"
+
+            results.append(BookResult(
+                isbn=isbn,
+                title=title,
+                authors=authors,
+                year="",
+                language=language.lower(),
+                extension=fmt.lower() if fmt else "",
+                size=size,
+                download_url=download_url,
+                source="annas_archive",
+                source_metadata={"hash": md5_hash, "publisher": publisher},
+            ))
+
+        return results
 
     def download(self, result: BookResult, output_path: str) -> bool:
+        md5_hash = result.source_metadata.get("hash", "")
+        if not md5_hash:
+            # Fall back to download_url directly
+            if result.download_url:
+                return _download_file(result.download_url, output_path, source="Anna's Archive")
+            print("  [Anna's Archive] No hash or download URL available")
+            return False
+
+        for server_id in range(self.SLOW_DOWNLOAD_SERVERS):
+            url = f"https://{self._base}/slow_download/{md5_hash}/0/{server_id}"
+            print(f"  [Anna's Archive] Trying server {server_id}...")
+            if _download_file(url, output_path, source="Anna's Archive"):
+                return True
+
+        print("  [Anna's Archive] All download servers failed")
         return False
 
 
