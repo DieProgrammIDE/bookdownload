@@ -1,16 +1,14 @@
-"""Phase 2: Download — download best candidate for each ISBN."""
+"""Download functions — download best candidate for each ISBN."""
 
 import asyncio
 import contextvars
 import os
 import re
 import time
-import threading
 
-import diskcache
 import requests
 
-from models import DOWNLOAD_HEADERS, BookResult, rank_candidates
+from models import DOWNLOAD_HEADERS, BookResult
 from tracing import observe, get_client, flush_tracing
 
 
@@ -39,7 +37,7 @@ def make_output_filename(isbn: str, book: BookResult) -> str:
     return f"{isbn}_{title_part}.{ext}"
 
 
-def _file_exists_for_isbn(isbn: str, output_dir: str) -> str | None:
+def file_exists_for_isbn(isbn: str, output_dir: str) -> str | None:
     try:
         for f in os.listdir(output_dir):
             if f.startswith(isbn + "_"):
@@ -78,6 +76,7 @@ def download_file(
             input={"attempt": attempt + 1, "max_retries": max_retries},
         )
         attempt_obs = attempt_cm.__enter__()
+        flush_tracing()  # visible in Langfuse immediately while in-progress
         try:
             resp = requests.get(
                 url,
@@ -259,7 +258,6 @@ async def _do_download(isbn, url, candidate, output_dir, active, download_metric
                 "avg_speed_mbps": round(speed_mbps, 2),
             },
         )
-        # Track aggregate metrics
         download_metrics["total_bytes"] += file_size
         download_metrics["completed"] += 1
     else:
@@ -295,6 +293,7 @@ async def download_one(
             "candidates": [c.to_dict() for c in ranked],
         },
     )
+    flush_tracing()
 
     for i, candidate in enumerate(ranked):
         tag = f"[{i + 1}/{len(ranked)}]"
@@ -350,155 +349,8 @@ async def download_one(
     return "failed", ranked[0] if ranked else None
 
 
-# ---------------------------------------------------------------------------
-# Download phase orchestrator
-# ---------------------------------------------------------------------------
-
 DEFAULT_CONCURRENCY = {
     "libgen": 3,
     "zlibrary": 3,
     "internet_archive": 5,
 }
-
-
-@observe(name="download-phase", capture_input=False, capture_output=False)
-async def run_download_phase(
-    isbns: list[str],
-    sources: dict,
-    cache: diskcache.Cache,
-    output_dir: str,
-    host_concurrency: int | None = None,
-) -> tuple[dict, dict]:
-    langfuse = get_client()
-    langfuse.update_current_span(
-        input={"isbn_count": len(isbns), "sources": list(sources.keys())},
-    )
-    flush_tracing()
-
-    # Build per-source semaphores
-    source_sems = {}
-    for name, default in DEFAULT_CONCURRENCY.items():
-        n = host_concurrency if host_concurrency is not None else default
-        source_sems[name] = asyncio.Semaphore(n)
-
-    # Anna's Archive per-server semaphores
-    if "annas_archive" in sources:
-        per_server = host_concurrency if host_concurrency is not None else 1
-        sources["annas_archive"].init_semaphores(per_server)
-
-    total = len(isbns)
-    stats = {"downloaded": 0, "exists": 0, "not_found": 0, "failed": 0}
-    stats_lock = threading.Lock()
-    results_log: dict = {}
-    active: dict = {}  # isbn -> progress info for status reporter
-
-    # Aggregate download metrics for Langfuse (thread-safe via GIL for simple increments)
-    download_metrics = {"total_bytes": 0, "completed": 0, "failed": 0}
-
-    async def process(isbn: str, idx: int):
-        existing = _file_exists_for_isbn(isbn, output_dir)
-        if existing:
-            with stats_lock:
-                stats["exists"] += 1
-            return isbn, "exists", None
-
-        discovery_key = f"discovery:{isbn}"
-        cached_discovery = cache.get(discovery_key)
-        if cached_discovery is None:
-            with stats_lock:
-                stats["not_found"] += 1
-            return isbn, "not_found", None
-
-        candidates = [BookResult.from_dict(d) for d in cached_discovery]
-        ranked = rank_candidates(candidates)
-        if not ranked:
-            with stats_lock:
-                stats["not_found"] += 1
-            return isbn, "not_found", None
-
-        log(isbn, f"[{idx}/{total}] {len(ranked)} candidate(s)")
-        status, selected = await download_one(
-            isbn, ranked, sources, output_dir, source_sems, active, download_metrics,
-        )
-        with stats_lock:
-            stats[status] = stats.get(status, 0) + 1
-        return isbn, status, selected
-
-    # Status reporter
-    start_time = asyncio.get_event_loop().time()
-    phase_start = time.time()
-
-    async def status_reporter():
-        while True:
-            await asyncio.sleep(30)
-            elapsed = asyncio.get_event_loop().time() - start_time
-            done = sum(stats.values())
-            snapshot = dict(active)
-
-            # Compute aggregate metrics
-            total_mb = download_metrics["total_bytes"] / 1048576
-            wall_elapsed = time.time() - phase_start
-            avg_speed = total_mb / wall_elapsed if wall_elapsed > 0 else 0
-
-            print(
-                f"\n=== Status [{done}/{total}] {elapsed:.0f}s "
-                f"| downloaded: {stats['downloaded']} "
-                f"| failed: {stats['failed']} "
-                f"| not_found: {stats['not_found']} "
-                f"| {len(snapshot)} active ==="
-            )
-            for isbn, info in snapshot.items():
-                mb = info["downloaded"] / 1048576
-                total_mb_item = info["total"] / 1048576 if info["total"] else 0
-                title = info.get("title", "")
-                if total_mb_item:
-                    print(f"  [{isbn}] {mb:.1f}/{total_mb_item:.1f} MB — {title}")
-                elif mb:
-                    print(f"  [{isbn}] {mb:.1f} MB — {title}")
-                else:
-                    print(f"  [{isbn}] starting — {title}")
-
-            # Update Langfuse with live aggregate metrics
-            langfuse.update_current_span(
-                metadata={
-                    "total_mb_downloaded": round(total_mb, 2),
-                    "avg_speed_mbps": round(avg_speed, 3),
-                    "active_downloads": len(snapshot),
-                    "completed": download_metrics["completed"],
-                    "failed": download_metrics["failed"],
-                    "elapsed_s": round(wall_elapsed, 1),
-                },
-            )
-            flush_tracing()
-
-    reporter = asyncio.create_task(status_reporter())
-    tasks = [process(isbn, i + 1) for i, isbn in enumerate(isbns)]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    reporter.cancel()
-
-    for r in results:
-        if isinstance(r, Exception):
-            print(f"  [error] Download exception: {r}")
-            stats["failed"] += 1
-        else:
-            isbn, status, selected = r
-            results_log[isbn] = {
-                "status": status,
-                "selected": selected.to_dict() if selected else None,
-            }
-
-    # Final span update
-    wall_elapsed = time.time() - phase_start
-    total_mb = download_metrics["total_bytes"] / 1048576
-    avg_speed = total_mb / wall_elapsed if wall_elapsed > 0 else 0
-    langfuse.update_current_span(
-        output={
-            "stats": stats,
-            "total_mb_downloaded": round(total_mb, 2),
-            "avg_speed_mbps": round(avg_speed, 3),
-            "duration_s": round(wall_elapsed, 1),
-        },
-    )
-    flush_tracing()
-
-    return stats, results_log

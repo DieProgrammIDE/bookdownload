@@ -1,4 +1,4 @@
-"""Phase 1: Discovery — search all sources for each ISBN."""
+"""Discovery — search all sources for a single ISBN."""
 
 import asyncio
 import contextvars
@@ -129,46 +129,3 @@ async def discover_isbn(
     )
     flush_tracing()
     return candidates, log
-
-
-@observe(name="discovery-phase", capture_input=False, capture_output=False)
-async def run_discovery_phase(
-    isbns: list[str],
-    sources: dict,
-    cache: diskcache.Cache,
-    concurrency: int,
-) -> dict:
-    langfuse = get_client()
-    langfuse.update_current_span(
-        input={
-            "isbn_count": len(isbns),
-            "sources": list(sources.keys()),
-            "concurrency": concurrency,
-        },
-    )
-    flush_tracing()
-
-    semaphore = asyncio.Semaphore(concurrency)
-
-    async def bounded(isbn: str, idx: int, total: int):
-        async with semaphore:
-            candidates, log_lines = await discover_isbn(isbn, sources, cache)
-            # Print header + results atomically so they don't interleave
-            output = f"\n[Discovery {idx}/{total}] {isbn}"
-            if log_lines:
-                output += "\n" + "\n".join(log_lines)
-            print(output)
-            return isbn, candidates
-
-    tasks = [bounded(isbn, i + 1, len(isbns)) for i, isbn in enumerate(isbns)]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    found = sum(1 for r in results if not isinstance(r, Exception) and r[1])
-    not_found = sum(1 for r in results if not isinstance(r, Exception) and not r[1])
-    errors = sum(1 for r in results if isinstance(r, Exception))
-    print(f"\nDiscovery: {found} found, {not_found} not found, {errors} errors")
-
-    summary = {"found": found, "not_found": not_found, "errors": errors}
-    langfuse.update_current_span(output=summary)
-    flush_tracing()
-    return summary

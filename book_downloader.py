@@ -8,6 +8,8 @@ import logging
 import os
 import re
 import sys
+import time
+import threading
 
 import diskcache
 from dotenv import load_dotenv
@@ -15,8 +17,11 @@ from dotenv import load_dotenv
 logging.getLogger("libgen_api_enhanced").setLevel(logging.ERROR)
 
 from tracing import observe, get_client, flush_tracing  # noqa: E402
-from discovery import run_discovery_phase  # noqa: E402
-from downloader import run_download_phase  # noqa: E402
+from discovery import discover_isbn  # noqa: E402
+from downloader import (  # noqa: E402
+    download_one, file_exists_for_isbn, log, DEFAULT_CONCURRENCY,
+)
+from models import BookResult, rank_candidates  # noqa: E402
 from sources import AnnasArchiveSource, InternetArchiveSource, LibGenSource, ZLibrarySource  # noqa: E402
 
 
@@ -38,6 +43,230 @@ def load_isbns(filepath: str) -> list[str]:
                 isbns.append(isbn)
     return isbns
 
+
+# ---------------------------------------------------------------------------
+# Per-ISBN pipeline (discovery + download under one span)
+# ---------------------------------------------------------------------------
+
+@observe(name="isbn", capture_input=False, capture_output=False)
+async def process_isbn(
+    isbn: str,
+    idx: int,
+    total: int,
+    sources: dict,
+    cache: diskcache.Cache,
+    output_dir: str,
+    source_sems: dict,
+    active: dict,
+    download_metrics: dict,
+    discovery_only: bool,
+    download_only: bool,
+) -> tuple[str, str, BookResult | None]:
+    """Process a single ISBN: discover then download. Returns (isbn, status, selected)."""
+    langfuse = get_client()
+    langfuse.update_current_span(name=f"isbn-{isbn}", input={"isbn": isbn, "index": idx, "total": total})
+    flush_tracing()
+
+    # Step 1: Discovery
+    candidates = []
+    if not download_only:
+        candidates, log_lines = await discover_isbn(isbn, sources, cache)
+        output = f"\n[{idx}/{total}] {isbn}"
+        if log_lines:
+            output += "\n" + "\n".join(log_lines)
+        print(output)
+
+    # Step 2: Download
+    if discovery_only:
+        langfuse.update_current_span(
+            output={"status": "discovery_only", "candidate_count": len(candidates)},
+        )
+        flush_tracing()
+        return isbn, "discovery_only", None
+
+    # Check if file already exists
+    existing = file_exists_for_isbn(isbn, output_dir)
+    if existing:
+        langfuse.update_current_span(
+            output={"status": "exists", "existing_file": existing},
+        )
+        flush_tracing()
+        return isbn, "exists", None
+
+    # Load candidates from cache (covers both fresh discovery and download-only mode)
+    cached_discovery = cache.get(f"discovery:{isbn}")
+    if cached_discovery is None:
+        langfuse.update_current_span(
+            output={"status": "not_found", "reason": "no discovery results"},
+        )
+        flush_tracing()
+        return isbn, "not_found", None
+
+    ranked = rank_candidates([BookResult.from_dict(d) for d in cached_discovery])
+    if not ranked:
+        langfuse.update_current_span(
+            output={"status": "not_found", "reason": "no rankable candidates"},
+        )
+        flush_tracing()
+        return isbn, "not_found", None
+
+    log(isbn, f"[{idx}/{total}] {len(ranked)} candidate(s)")
+    status, selected = await download_one(
+        isbn, ranked, sources, output_dir, source_sems, active, download_metrics,
+    )
+
+    langfuse.update_current_span(
+        output={
+            "status": status,
+            "selected": selected.to_dict() if selected else None,
+        },
+    )
+    flush_tracing()
+    return isbn, status, selected
+
+
+# ---------------------------------------------------------------------------
+# Unified pipeline
+# ---------------------------------------------------------------------------
+
+@observe(name="pipeline", capture_input=False, capture_output=False)
+async def run_pipeline(
+    isbns: list[str],
+    sources: dict,
+    cache: diskcache.Cache,
+    output_dir: str,
+    concurrency: int,
+    host_concurrency: int | None = None,
+    discovery_only: bool = False,
+    download_only: bool = False,
+) -> tuple[dict, dict]:
+    langfuse = get_client()
+    langfuse.update_current_span(
+        input={
+            "isbn_count": len(isbns),
+            "isbns": isbns,
+            "sources": list(sources.keys()),
+            "concurrency": concurrency,
+            "discovery_only": discovery_only,
+            "download_only": download_only,
+        },
+    )
+    flush_tracing()
+
+    # Build per-source semaphores
+    source_sems = {}
+    for name, default in DEFAULT_CONCURRENCY.items():
+        n = host_concurrency if host_concurrency is not None else default
+        source_sems[name] = asyncio.Semaphore(n)
+
+    # Anna's Archive per-server semaphores
+    if "annas_archive" in sources:
+        per_server = host_concurrency if host_concurrency is not None else 1
+        sources["annas_archive"].init_semaphores(per_server)
+
+    total = len(isbns)
+    stats = {"downloaded": 0, "exists": 0, "not_found": 0, "failed": 0}
+    stats_lock = threading.Lock()
+    results_log: dict = {}
+    active: dict = {}
+    download_metrics = {"total_bytes": 0, "completed": 0, "failed": 0}
+
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def bounded(isbn: str, idx: int):
+        async with semaphore:
+            return await process_isbn(
+                isbn, idx, total, sources, cache, output_dir,
+                source_sems, active, download_metrics,
+                discovery_only, download_only,
+            )
+
+    # Status reporter
+    start_time = asyncio.get_event_loop().time()
+    phase_start = time.time()
+
+    async def status_reporter():
+        while True:
+            await asyncio.sleep(30)
+            elapsed = asyncio.get_event_loop().time() - start_time
+            done = sum(stats.values())
+            snapshot = dict(active)
+
+            total_mb = download_metrics["total_bytes"] / 1048576
+            wall_elapsed = time.time() - phase_start
+            avg_speed = total_mb / wall_elapsed if wall_elapsed > 0 else 0
+
+            print(
+                f"\n=== Status [{done}/{total}] {elapsed:.0f}s "
+                f"| downloaded: {stats['downloaded']} "
+                f"| failed: {stats['failed']} "
+                f"| not_found: {stats['not_found']} "
+                f"| {len(snapshot)} active ==="
+            )
+            for isbn, info in snapshot.items():
+                mb = info["downloaded"] / 1048576
+                total_mb_item = info["total"] / 1048576 if info["total"] else 0
+                title = info.get("title", "")
+                if total_mb_item:
+                    print(f"  [{isbn}] {mb:.1f}/{total_mb_item:.1f} MB — {title}")
+                elif mb:
+                    print(f"  [{isbn}] {mb:.1f} MB — {title}")
+                else:
+                    print(f"  [{isbn}] starting — {title}")
+
+            langfuse.update_current_span(
+                metadata={
+                    "total_mb_downloaded": round(total_mb, 2),
+                    "avg_speed_mbps": round(avg_speed, 3),
+                    "active_downloads": len(snapshot),
+                    "completed": download_metrics["completed"],
+                    "failed": download_metrics["failed"],
+                    "elapsed_s": round(wall_elapsed, 1),
+                },
+            )
+            flush_tracing()
+
+    reporter = asyncio.create_task(status_reporter())
+    tasks = [bounded(isbn, i + 1) for i, isbn in enumerate(isbns)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    reporter.cancel()
+
+    for r in results:
+        if isinstance(r, Exception):
+            print(f"  [error] Pipeline exception: {r}")
+            with stats_lock:
+                stats["failed"] += 1
+        else:
+            isbn, status, selected = r
+            if status != "discovery_only":
+                with stats_lock:
+                    stats[status] = stats.get(status, 0) + 1
+            results_log[isbn] = {
+                "status": status,
+                "selected": selected.to_dict() if selected else None,
+            }
+
+    # Final span update
+    wall_elapsed = time.time() - phase_start
+    total_mb = download_metrics["total_bytes"] / 1048576
+    avg_speed = total_mb / wall_elapsed if wall_elapsed > 0 else 0
+    langfuse.update_current_span(
+        output={
+            "stats": stats,
+            "total_mb_downloaded": round(total_mb, 2),
+            "avg_speed_mbps": round(avg_speed, 3),
+            "duration_s": round(wall_elapsed, 1),
+            "results": results_log,
+        },
+    )
+    flush_tracing()
+
+    return stats, results_log
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 @observe(name="book-downloader-session", capture_input=False, capture_output=False)
 async def main():
@@ -85,7 +314,7 @@ async def main():
     # Concurrency
     parser.add_argument(
         "--discovery-concurrency", type=int, default=10,
-        help="Max parallel ISBN searches during discovery (default: 10)",
+        help="Max parallel ISBN processing (default: 10)",
     )
     parser.add_argument(
         "--host-concurrency", type=int, default=None,
@@ -156,7 +385,7 @@ async def main():
         print("Error: No sources available.")
         sys.exit(1)
 
-    # Update session span with metadata
+    # Update session span
     langfuse.update_current_span(
         input={
             "isbn_count": len(isbns),
@@ -171,17 +400,22 @@ async def main():
 
     try:
         # ------------------------------------------------------------------
-        # Phase 1: Discovery
+        # Run unified pipeline
         # ------------------------------------------------------------------
-        if not args.download_only:
-            print(f"\n{'=' * 60}")
-            print(
-                f"Phase 1: Discovery  "
-                f"[{len(isbns)} ISBNs, concurrency={args.discovery_concurrency}]"
-            )
-            print(f"{'=' * 60}")
-            await run_discovery_phase(isbns, sources, cache, args.discovery_concurrency)
-            flush_tracing()
+        print(f"\n{'=' * 60}")
+        if args.discovery_only:
+            print(f"Pipeline: Discovery only [{len(isbns)} ISBNs]")
+        elif args.download_only:
+            print(f"Pipeline: Download only [{len(isbns)} ISBNs]")
+        else:
+            print(f"Pipeline: Discover + Download [{len(isbns)} ISBNs]")
+        print(f"{'=' * 60}")
+
+        stats, results_log = await run_pipeline(
+            isbns, sources, cache, args.output_dir,
+            args.discovery_concurrency, args.host_concurrency,
+            args.discovery_only, args.download_only,
+        )
 
         # Save discovery metadata
         discovery_data = {}
@@ -193,28 +427,10 @@ async def main():
             json.dump(discovery_data, f, indent=2, ensure_ascii=False)
         print(f"\nDiscovery metadata written to {discovery_path}")
 
-        # ------------------------------------------------------------------
-        # Phase 2: Download
-        # ------------------------------------------------------------------
-        stats = {}
-        results_log = {}
+        # Summary
         if not args.discovery_only:
-            print(f"\n{'=' * 60}")
-            print(f"Phase 2: Download")
-            print(f"{'=' * 60}")
-            stats, results_log = await run_download_phase(
-                isbns, sources, cache, args.output_dir, args.host_concurrency,
-            )
-            flush_tracing()
-
-            not_found = [
-                isbn for isbn, info in results_log.items()
-                if info["status"] == "not_found"
-            ]
-            failed = [
-                isbn for isbn, info in results_log.items()
-                if info["status"] == "failed"
-            ]
+            not_found = [isbn for isbn, info in results_log.items() if info["status"] == "not_found"]
+            failed = [isbn for isbn, info in results_log.items() if info["status"] == "failed"]
 
             print(f"\n{'=' * 60}")
             print("Summary:")
@@ -236,17 +452,11 @@ async def main():
             results_path = os.path.join(args.output_dir, "results.json")
             with open(results_path, "w") as f:
                 json.dump(
-                    {
-                        "stats": stats,
-                        "results": results_log,
-                        "not_found": not_found,
-                        "failed": failed,
-                    },
+                    {"stats": stats, "results": results_log, "not_found": not_found, "failed": failed},
                     f, indent=2, ensure_ascii=False,
                 )
             print(f"\nResults written to {results_path}")
 
-            # Update session span with final stats
             langfuse.update_current_span(
                 output={
                     "stats": stats,
@@ -257,9 +467,6 @@ async def main():
             )
 
     finally:
-        # ------------------------------------------------------------------
-        # Cleanup
-        # ------------------------------------------------------------------
         if "zlibrary" in sources:
             await sources["zlibrary"].close()
         if "annas_archive" in sources:
