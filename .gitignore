@@ -1,0 +1,33 @@
+# Downloaded/output files
+*.pdf
+*.epub
+*.mobi
+*.azw
+*.azw3
+*.djvu
+*.cbz
+*.cbr
+*.fb2
+
+# Media files
+*.mp4
+*.mp3
+*.wav
+*.avi
+*.mkv
+*.flac
+*.ogg
+*.webm
+*.mov
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.webp
+
+# Python temp files
+*.pyc
+*.pyo
+__pycache__/
