@@ -53,6 +53,7 @@ def _file_exists_for_isbn(isbn: str, output_dir: str) -> str | None:
 # File download
 # ---------------------------------------------------------------------------
 
+@observe(name="download-file-attempts", capture_input=False, capture_output=False)
 def download_file(
     url: str,
     output_path: str,
@@ -64,7 +65,19 @@ def download_file(
 
     progress_cb(downloaded_bytes, total_bytes) is called every ~10s.
     """
+    langfuse = get_client()
+    langfuse.update_current_span(
+        input={"url": url, "source": source, "max_retries": max_retries},
+    )
+    flush_tracing()
+
     for attempt in range(max_retries):
+        attempt_cm = langfuse.start_as_current_observation(
+            as_type="span",
+            name=f"download-attempt-{attempt + 1}",
+            input={"attempt": attempt + 1, "max_retries": max_retries},
+        )
+        attempt_obs = attempt_cm.__enter__()
         try:
             resp = requests.get(
                 url,
@@ -80,6 +93,12 @@ def download_file(
                     f"  [{source}] Rate limited "
                     f"(attempt {attempt + 1}/{max_retries}), waiting {wait}s..."
                 )
+                attempt_obs.update(
+                    output={"status_code": resp.status_code, "action": "rate_limited", "wait_s": wait},
+                    level="WARNING",
+                )
+                attempt_cm.__exit__(None, None, None)
+                flush_tracing()
                 time.sleep(wait)
                 continue
 
@@ -100,6 +119,11 @@ def download_file(
             file_size = os.path.getsize(output_path)
             if file_size == 0:
                 os.remove(output_path)
+                attempt_obs.update(output={"status_code": resp.status_code, "error": "empty file"}, level="ERROR")
+                attempt_cm.__exit__(None, None, None)
+                flush_tracing()
+                langfuse.update_current_span(output={"success": False, "error": "downloaded file is empty", "attempts": attempt + 1})
+                flush_tracing()
                 return False, "downloaded file is empty"
 
             if output_path.lower().endswith(".pdf"):
@@ -107,11 +131,26 @@ def download_file(
                     header = f.read(5)
                 if header != b"%PDF-":
                     os.remove(output_path)
-                    return False, f"not a valid PDF (header: {header!r})"
+                    err = f"not a valid PDF (header: {header!r})"
+                    attempt_obs.update(output={"status_code": resp.status_code, "error": err}, level="ERROR")
+                    attempt_cm.__exit__(None, None, None)
+                    flush_tracing()
+                    langfuse.update_current_span(output={"success": False, "error": err, "attempts": attempt + 1})
+                    flush_tracing()
+                    return False, err
 
+            attempt_obs.update(output={"status_code": resp.status_code, "downloaded_bytes": downloaded, "total_bytes": total_size})
+            attempt_cm.__exit__(None, None, None)
+            flush_tracing()
+            langfuse.update_current_span(output={"success": True, "attempts": attempt + 1, "downloaded_bytes": downloaded})
+            flush_tracing()
             return True, None
 
         except requests.exceptions.RequestException as e:
+            action = "retry" if attempt < max_retries - 1 else "give_up"
+            attempt_obs.update(output={"error": str(e), "action": action}, level="ERROR", status_message=str(e))
+            attempt_cm.__exit__(None, None, None)
+            flush_tracing()
             if attempt < max_retries - 1:
                 wait = min(5 * 2**attempt, 120)
                 print(
@@ -121,8 +160,12 @@ def download_file(
                 )
                 time.sleep(wait)
             else:
+                langfuse.update_current_span(output={"success": False, "error": str(e), "attempts": attempt + 1})
+                flush_tracing()
                 return False, str(e)
 
+    langfuse.update_current_span(output={"success": False, "error": "max retries exceeded", "attempts": max_retries})
+    flush_tracing()
     return False, "max retries exceeded"
 
 
@@ -150,7 +193,7 @@ async def _do_download(isbn, url, candidate, output_dir, active, download_metric
         input={
             "isbn": isbn,
             "source": candidate.source,
-            "url_domain": url.split("/")[2] if "/" in url else url,
+            "url": url,
             "filename": filename,
         },
         trace_context={
@@ -246,7 +289,11 @@ async def download_one(
     """Download best match for isbn, trying candidates in ranked order."""
     langfuse = get_client()
     langfuse.update_current_span(
-        input={"isbn": isbn, "candidate_count": len(ranked)},
+        input={
+            "isbn": isbn,
+            "candidate_count": len(ranked),
+            "candidates": [c.to_dict() for c in ranked],
+        },
     )
 
     for i, candidate in enumerate(ranked):
@@ -284,6 +331,7 @@ async def download_one(
                     "status": "downloaded",
                     "source": candidate.source,
                     "candidate_index": i + 1,
+                    "selected": candidate.to_dict(),
                 },
             )
             flush_tracing()
@@ -291,7 +339,11 @@ async def download_one(
         log(isbn, f"{tag} failed: {error}")
 
     langfuse.update_current_span(
-        output={"status": "failed", "candidates_tried": len(ranked)},
+        output={
+            "status": "failed",
+            "candidates_tried": len(ranked),
+            "candidates_sources": [c.source for c in ranked],
+        },
         level="WARNING",
     )
     flush_tracing()

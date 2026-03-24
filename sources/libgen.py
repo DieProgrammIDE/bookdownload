@@ -43,6 +43,9 @@ class LibGenSource:
                 download_url=download_url,
                 source="libgen",
             ))
-        langfuse.update_current_span(output={"result_count": len(books)})
+        langfuse.update_current_span(output={
+            "result_count": len(books),
+            "results": [b.to_dict() for b in books],
+        })
         flush_tracing()
         return books

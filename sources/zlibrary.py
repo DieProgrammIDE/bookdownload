@@ -100,7 +100,10 @@ class ZLibrarySource:
                     source="zlibrary",
                 ))
 
-            langfuse.update_current_span(output={"result_count": len(results)})
+            langfuse.update_current_span(output={
+                "result_count": len(results),
+                "results": [r.to_dict() for r in results],
+            })
             flush_tracing()
             return results
 

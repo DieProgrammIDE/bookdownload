@@ -1,6 +1,7 @@
 """Anna's Archive backend: HTML scraping for search, Playwright for DDoS-Guard bypass."""
 
 import asyncio
+import contextvars
 import itertools
 import re
 import time
@@ -83,7 +84,7 @@ class AnnasArchiveSource:
                         f"{max_retries} attempts: {e}"
                     )
                     langfuse.update_current_span(
-                        output={"result_count": 0, "retries": attempt + 1, "error": str(e)},
+                        output={"result_count": 0, "retries": attempt + 1, "error": str(e), "results": []},
                         level="ERROR",
                         status_message=str(e),
                     )
@@ -92,7 +93,7 @@ class AnnasArchiveSource:
         else:
             # All retries exhausted (rate limiting)
             langfuse.update_current_span(
-                output={"result_count": 0, "retries": max_retries, "error": "rate limited"},
+                output={"result_count": 0, "retries": max_retries, "error": "rate limited", "results": []},
                 level="ERROR",
                 status_message="rate limited after all retries",
             )
@@ -160,7 +161,11 @@ class AnnasArchiveSource:
             ))
 
         langfuse.update_current_span(
-            output={"result_count": len(results), "retries": attempt + 1},
+            output={
+                "result_count": len(results),
+                "retries": attempt + 1,
+                "results": [r.to_dict() for r in results],
+            },
         )
         flush_tracing()
         return results
@@ -178,21 +183,29 @@ class AnnasArchiveSource:
         )
 
         loop = asyncio.get_running_loop()
+        ctx = contextvars.copy_context()
         url = await loop.run_in_executor(
-            self._executor, self._do_extract, md5_hash, start_server,
+            self._executor, ctx.run, self._do_extract, md5_hash, start_server,
         )
 
         langfuse.update_current_span(
-            output={"success": url is not None, "url_found": bool(url)},
+            output={"success": url is not None, "url": url},
         )
         flush_tracing()
         return url
 
+    @observe(name="extract-do-extract", capture_input=False, capture_output=False)
     def _do_extract(self, md5_hash: str, start_server: int) -> str | None:
         """Try servers with up to 3 full passes. Fully synchronous."""
+        langfuse = get_client()
+        langfuse.update_current_span(
+            input={"md5_hash": md5_hash, "start_server": start_server, "max_passes": 3},
+        )
+
         self._ensure_browser()
         servers = [start_server] + [s for s in self.SERVERS if s != start_server]
         max_passes = 3
+        pass_num = 0
         for pass_num in range(max_passes):
             if pass_num > 0:
                 wait = min(10 * 2**pass_num, 60)
@@ -206,11 +219,28 @@ class AnnasArchiveSource:
                 url = self._try_server(md5_hash, sid)
                 if url:
                     self._on_success()
+                    langfuse.update_current_span(
+                        output={"success": True, "passes_attempted": pass_num + 1, "url": url},
+                    )
+                    flush_tracing()
                     return url
+
+        langfuse.update_current_span(
+            output={"success": False, "passes_attempted": pass_num + 1},
+            level="WARNING",
+            status_message="all server passes exhausted",
+        )
+        flush_tracing()
         return None
 
+    @observe(name="extract-try-server", capture_input=False, capture_output=False)
     def _try_server(self, md5_hash: str, server_id: int) -> str | None:
         """Visit slow_download page, wait for DDoS-Guard, extract direct URL."""
+        langfuse = get_client()
+        langfuse.update_current_span(
+            input={"md5_hash": md5_hash, "server_id": server_id},
+        )
+
         url_re = re.compile(
             r'https?://[^\s"<>\']+' + re.escape(md5_hash) + r'[^\s"<>\']*'
         )
@@ -232,13 +262,35 @@ class AnnasArchiveSource:
 
             html = page.content()
             if "Download from partner" not in html and "slow_download" not in html:
+                langfuse.update_current_span(
+                    output={"success": False, "reason": "no download content on page"},
+                    level="WARNING",
+                )
+                flush_tracing()
                 return None
 
             match = url_re.search(html)
             if match:
-                return match.group(0)
-        except Exception:
+                result_url = match.group(0)
+                langfuse.update_current_span(
+                    output={"success": True, "url": result_url},
+                )
+                flush_tracing()
+                return result_url
+
+            langfuse.update_current_span(
+                output={"success": False, "reason": "no URL match in HTML"},
+                level="WARNING",
+            )
+            flush_tracing()
+        except Exception as e:
             self._on_failure()
+            langfuse.update_current_span(
+                output={"success": False, "error": str(e)},
+                level="ERROR",
+                status_message=str(e),
+            )
+            flush_tracing()
         finally:
             context.close()
         return None

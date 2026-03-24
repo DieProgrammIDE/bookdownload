@@ -58,7 +58,11 @@ async def discover_isbn(
         candidates = [BookResult.from_dict(d) for d in cached]
         log.append(f"  [cache] {len(candidates)} candidate(s)")
         langfuse.update_current_span(
-            output={"candidate_count": len(candidates), "from_cache": True},
+            output={
+                "candidate_count": len(candidates),
+                "from_cache": True,
+                "candidates": [c.to_dict() for c in candidates],
+            },
         )
         flush_tracing()
         return candidates, log
@@ -109,7 +113,7 @@ async def discover_isbn(
             source_results[name] = {"count": 0, "error": error}
         else:
             log.append(f"  [{name}] {_format_source_summary(books)}")
-            source_results[name] = {"count": len(books)}
+            source_results[name] = {"count": len(books), "results": [b.to_dict() for b in books]}
         if books:
             candidates.extend(books)
 
@@ -120,6 +124,7 @@ async def discover_isbn(
             "candidate_count": len(candidates),
             "from_cache": False,
             "sources": source_results,
+            "candidates": [c.to_dict() for c in candidates],
         },
     )
     flush_tracing()

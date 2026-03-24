@@ -160,6 +160,7 @@ async def main():
     langfuse.update_current_span(
         input={
             "isbn_count": len(isbns),
+            "isbns": isbns,
             "sources": list(sources.keys()),
             "output_dir": args.output_dir,
             "discovery_only": args.discovery_only,
@@ -251,6 +252,7 @@ async def main():
                     "stats": stats,
                     "not_found_count": len(not_found),
                     "failed_count": len(failed),
+                    "results": results_log,
                 },
             )
 
