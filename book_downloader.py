@@ -4,12 +4,17 @@
 import argparse
 import asyncio
 import json
+import logging
 import os
 import re
 import sys
+from collections import defaultdict
 
 import diskcache
 from dotenv import load_dotenv
+
+# Suppress noisy warnings from libgen library ("No results table found on search page")
+logging.getLogger("libgen_api_enhanced").setLevel(logging.ERROR)
 
 from sources import (
     AnnasArchiveSource,
@@ -65,6 +70,20 @@ def _file_exists_for_isbn(isbn: str, output_dir: str) -> str | None:
     except OSError:
         pass
     return None
+
+
+def _format_source_summary(books: list) -> str:
+    """Format a summary like '2 PDF (5.2MB, 3.1MB), 1 EPUB (1.2MB)'."""
+    if not books:
+        return "no results"
+    by_ext = defaultdict(list)
+    for b in books:
+        by_ext[b.extension.upper() or "?"].append(b.size or "?")
+    parts = []
+    for ext in sorted(by_ext, key=lambda e: (e != "PDF", e)):
+        sizes = by_ext[ext]
+        parts.append(f"{len(sizes)} {ext} ({', '.join(sizes)})")
+    return f"{len(books)} result(s): {', '.join(parts)}"
 
 
 # ---------------------------------------------------------------------------
@@ -124,8 +143,8 @@ async def discover_isbn(
             print(f"  [error] {r}")
             continue
         name, books = r
+        print(f"  [{name}] {_format_source_summary(books)}")
         if books:
-            print(f"  [{name}] {len(books)} result(s)")
             candidates.extend(books)
 
     cache.set(cache_key, [c.to_dict() for c in candidates])
@@ -164,35 +183,34 @@ async def download_isbn(
     sources: dict,
     cache: diskcache.Cache,
     output_dir: str,
-    any_format: bool,
-) -> str:
-    """Download best match for isbn. Returns status string."""
+) -> tuple[str, BookResult | None]:
+    """Download best match for isbn. Returns (status, selected_book)."""
     download_key = f"download:{isbn}"
 
     cached_status = cache.get(download_key)
     if cached_status == "downloaded":
-        return "exists"
+        return "exists", None
 
     existing = _file_exists_for_isbn(isbn, output_dir)
     if existing:
         cache.set(download_key, "downloaded")
         print(f"  Already on disk: {existing}")
-        return "exists"
+        return "exists", None
 
     discovery_key = f"discovery:{isbn}"
     cached_discovery = cache.get(discovery_key)
     if cached_discovery is None:
         print(f"  No discovery results (run discovery phase first)")
-        return "not_found"
+        return "not_found", None
 
     candidates = [BookResult.from_dict(d) for d in cached_discovery]
     if not candidates:
-        return "not_found"
+        return "not_found", None
 
-    best = select_best(candidates, any_format=any_format)
+    best = select_best(candidates)
     if not best:
         print(f"  No suitable format found among {len(candidates)} candidate(s)")
-        return "not_found"
+        return "not_found", None
 
     print(f"  → \"{best.title}\" ({best.language}, {best.extension}, {best.size}) [{best.source}]")
 
@@ -207,7 +225,7 @@ async def download_isbn(
         else:
             print(f"  Source '{best.source}' unavailable and no URL cached")
             cache.set(download_key, "failed")
-            return "failed"
+            return "failed", best
     elif isinstance(source, ZLibrarySource):
         success = await source.download(best, output_path)
     else:
@@ -217,11 +235,11 @@ async def download_isbn(
         size = os.path.getsize(output_path)
         print(f"  Saved: {filename} ({size:,} bytes)")
         cache.set(download_key, "downloaded")
-        return "downloaded"
+        return "downloaded", best
     else:
         print(f"  Download failed")
         cache.set(download_key, "failed")
-        return "failed"
+        return "failed", best
 
 
 async def run_download_phase(
@@ -229,7 +247,6 @@ async def run_download_phase(
     sources: dict,
     cache: diskcache.Cache,
     output_dir: str,
-    any_format: bool,
     concurrency: int,
 ) -> tuple[dict, dict]:
     semaphore = asyncio.Semaphore(concurrency)
@@ -237,7 +254,8 @@ async def run_download_phase(
     async def bounded(isbn: str, idx: int, total: int):
         async with semaphore:
             print(f"\n[Download {idx}/{total}] {isbn}")
-            return isbn, await download_isbn(isbn, sources, cache, output_dir, any_format)
+            status, selected = await download_isbn(isbn, sources, cache, output_dir)
+            return isbn, status, selected
 
     tasks = [bounded(isbn, i + 1, len(isbns)) for i, isbn in enumerate(isbns)]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -248,9 +266,12 @@ async def run_download_phase(
         if isinstance(r, Exception):
             stats["failed"] += 1
         else:
-            isbn, status = r
+            isbn, status, selected = r
             stats[status] = stats.get(status, 0) + 1
-            results_log[isbn] = status
+            results_log[isbn] = {
+                "status": status,
+                "selected": selected.to_dict() if selected else None,
+            }
 
     return stats, results_log
 
@@ -268,7 +289,8 @@ async def main():
     parser.add_argument("--libgen-mirror", default="li", help="LibGen mirror TLD: li, bz, gs (default: li)")
     parser.add_argument("--annas-mirror", default="annas-archive.gl",
                         help="Anna's Archive mirror domain (default: annas-archive.gl)")
-    parser.add_argument("--any-format", action="store_true", help="Accept EPUB/DJVU if no PDF available")
+    parser.add_argument("--any-format", action="store_true",
+                        help="(deprecated, always enabled) Accept any format")
 
     # Source toggles
     parser.add_argument("--no-libgen", action="store_true", help="Skip LibGen")
@@ -355,6 +377,18 @@ async def main():
         print(f"{'='*60}")
         await run_discovery_phase(isbns, sources, cache, args.discovery_concurrency)
 
+    # Save discovery metadata JSON
+    discovery_data = {}
+    for isbn in isbns:
+        cached = cache.get(f"discovery:{isbn}")
+        discovery_data[isbn] = {
+            "candidates": cached if cached is not None else [],
+        }
+    discovery_path = os.path.join(args.output_dir, "discovery.json")
+    with open(discovery_path, "w") as f:
+        json.dump(discovery_data, f, indent=2, ensure_ascii=False)
+    print(f"\nDiscovery metadata written to {discovery_path}")
+
     # Phase 2: Download
     stats = {}
     results_log = {}
@@ -363,11 +397,11 @@ async def main():
         print(f"Phase 2: Download  [concurrency={args.download_concurrency}]")
         print(f"{'='*60}")
         stats, results_log = await run_download_phase(
-            isbns, sources, cache, args.output_dir, args.any_format, args.download_concurrency
+            isbns, sources, cache, args.output_dir, args.download_concurrency
         )
 
-        not_found = [isbn for isbn, s in results_log.items() if s == "not_found"]
-        failed = [isbn for isbn, s in results_log.items() if s == "failed"]
+        not_found = [isbn for isbn, info in results_log.items() if info["status"] == "not_found"]
+        failed = [isbn for isbn, info in results_log.items() if info["status"] == "failed"]
 
         print(f"\n{'='*60}")
         print(f"Summary:")
@@ -389,7 +423,7 @@ async def main():
         results_path = os.path.join(args.output_dir, "results.json")
         with open(results_path, "w") as f:
             json.dump({"stats": stats, "results": results_log,
-                       "not_found": not_found, "failed": failed}, f, indent=2)
+                       "not_found": not_found, "failed": failed}, f, indent=2, ensure_ascii=False)
         print(f"\nResults written to {results_path}")
 
     # Cleanup

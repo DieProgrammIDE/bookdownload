@@ -56,42 +56,17 @@ def _parse_size(size_str: str) -> int:
     return int(val * multipliers.get(unit, 1))
 
 
-def select_best(candidates: list[BookResult], any_format: bool = False) -> BookResult | None:
-    """Select the best book match from candidates."""
+def select_best(candidates: list[BookResult]) -> BookResult | None:
+    """Select the best book match: prefer PDF, then largest file size."""
     if not candidates:
         return None
 
     def score(book: BookResult) -> tuple:
-        is_german = book.language in ("german", "deutsch", "de", "ger", "deu")
         is_pdf = book.extension == "pdf"
-        allowed_format = is_pdf or (any_format and book.extension in ("epub", "djvu", "mobi"))
-
-        if not allowed_format and not is_pdf:
-            return (0, 0, 0, 0)
-
         size_bytes = _parse_size(book.size)
+        return (1 if is_pdf else 0, size_bytes)
 
-        if is_german and is_pdf:
-            return (4, size_bytes, 1, 1)
-        elif is_german and allowed_format:
-            return (3, size_bytes, 1, 0)
-        elif is_pdf:
-            return (2, size_bytes, 0, 1)
-        elif allowed_format:
-            return (1, size_bytes, 0, 0)
-        return (0, 0, 0, 0)
-
-    scored = [(score(c), c) for c in candidates]
-    scored = [(s, c) for s, c in scored if s[0] > 0]
-
-    if not scored:
-        if any_format and candidates:
-            return candidates[0]
-        pdfs = [c for c in candidates if c.extension == "pdf"]
-        return pdfs[0] if pdfs else candidates[0]
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return scored[0][1]
+    return max(candidates, key=score)
 
 
 class LibGenSource:
