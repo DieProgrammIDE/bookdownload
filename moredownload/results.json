@@ -1,7 +1,7 @@
 {
   "stats": {
-    "downloaded": 3,
-    "exists": 0,
+    "downloaded": 0,
+    "exists": 3,
     "not_found": 262,
     "failed": 32
   },
@@ -351,19 +351,8 @@
       "selected": null
     },
     "9783127353105": {
-      "status": "downloaded",
-      "selected": {
-        "isbn": "9783127353105",
-        "title": "Lambacher Schweizer  Mathematik fr Gymnasien Kursstufe",
-        "authors": "",
-        "year": "2017",
-        "language": "german",
-        "extension": "pdf",
-        "size": "148 MB",
-        "download_url": "https://libgen.li/get.php?md5=1470aa409fddad685cdaee02210a0b16&key=71NY72QPZ27WUT4O",
-        "source": "libgen",
-        "source_metadata": {}
-      }
+      "status": "exists",
+      "selected": null
     },
     "9783127353839": {
       "status": "not_found",
@@ -762,19 +751,8 @@
       "selected": null
     },
     "9783658245733": {
-      "status": "downloaded",
-      "selected": {
-        "isbn": "9783658245733",
-        "title": "HochSchulmathematik Ein Sprungbrett vom Gymnasium an die Uni",
-        "authors": "Tobias Glosauer",
-        "year": "2019",
-        "language": "german",
-        "extension": "pdf",
-        "size": "6 MB",
-        "download_url": "https://libgen.li/get.php?md5=5d34745dc962e0e72eb4ee4697e8ad33&key=9868TNXOXQJUXEQ3",
-        "source": "libgen",
-        "source_metadata": {}
-      }
+      "status": "exists",
+      "selected": null
     },
     "9783661610092": {
       "status": "not_found",
@@ -1029,19 +1007,8 @@
       "selected": null
     },
     "9783849062125": {
-      "status": "downloaded",
-      "selected": {
-        "isbn": "9783849062125",
-        "title": "Mathematik eA  Abitur 2026 Bayern  Prfungsvorbereitung",
-        "authors": "Stark Verlag",
-        "year": "2025 July 27",
-        "language": "",
-        "extension": "pdf",
-        "size": "6 MB",
-        "download_url": "https://libgen.li/get.php?md5=a82f613c335f7722ddc85fc75acc20da&key=QC45N8RWXD5X1Q25",
-        "source": "libgen",
-        "source_metadata": {}
-      }
+      "status": "exists",
+      "selected": null
     },
     "9783849062347": {
       "status": "not_found",

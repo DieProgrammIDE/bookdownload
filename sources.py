@@ -57,17 +57,27 @@ def _parse_size(size_str: str) -> int:
     return int(val * multipliers.get(unit, 1))
 
 
-def select_best(candidates: list[BookResult]) -> BookResult | None:
-    """Select the best book match: prefer PDF, then largest file size."""
+SOURCE_RANK = {"annas_archive": 3, "zlibrary": 2, "internet_archive": 1, "libgen": 0}
+
+
+def rank_candidates(candidates: list[BookResult]) -> list[BookResult]:
+    """Rank candidates: prefer PDF, then Anna's Archive, then largest size."""
     if not candidates:
-        return None
+        return []
 
     def score(book: BookResult) -> tuple:
-        is_pdf = book.extension == "pdf"
+        is_pdf = 1 if book.extension == "pdf" else 0
+        source_pref = SOURCE_RANK.get(book.source, 0)
         size_bytes = _parse_size(book.size)
-        return (1 if is_pdf else 0, size_bytes)
+        return (is_pdf, source_pref, size_bytes)
 
-    return max(candidates, key=score)
+    return sorted(candidates, key=score, reverse=True)
+
+
+def select_best(candidates: list[BookResult]) -> BookResult | None:
+    """Select the best book match."""
+    ranked = rank_candidates(candidates)
+    return ranked[0] if ranked else None
 
 
 class LibGenSource:
@@ -263,16 +273,16 @@ class AnnasArchiveSource:
             time.sleep(wait)
 
     def _on_failure(self):
-        """Increase backoff exponentially (10s → 20s → 40s → ... → 120s cap)."""
-        with self._lock:
-            self._backoff_seconds = min(max(self._backoff_seconds * 2, 10), 120)
-            self._backoff_until = time.time() + self._backoff_seconds
+        """Increase backoff exponentially (10s → 20s → 40s → ... → 120s cap).
+        Must be called while self._lock is held."""
+        self._backoff_seconds = min(max(self._backoff_seconds * 2, 10), 120)
+        self._backoff_until = time.time() + self._backoff_seconds
 
     def _on_success(self):
-        """Reset backoff on successful download."""
-        with self._lock:
-            self._backoff_seconds = 0
-            self._backoff_until = 0.0
+        """Reset backoff on successful download.
+        Must be called while self._lock is held."""
+        self._backoff_seconds = 0
+        self._backoff_until = 0.0
 
     def _parse_meta(self, meta_text: str) -> tuple[str, str, str]:
         """Parse metadata string like '✅ German [de] · PDF · 9.0MB · 2017'."""
@@ -395,13 +405,15 @@ class AnnasArchiveSource:
         The actual file download happens outside the lock so multiple files can
         download in parallel.
         """
-        # Build regex to match direct download URLs containing the hash
-        ext_pattern = re.escape(extension) if extension else r"[a-z]+"
+        # Match URLs containing the hash (the direct download link)
         url_re = re.compile(
-            r'https?://[^\s"<>\']+' + re.escape(md5_hash) + r'[^\s"<>\']*\.' + ext_pattern
+            r'https?://[^\s"<>\']+' + re.escape(md5_hash) + r'[^\s"<>\']*'
         )
 
-        with self._lock:
+        if not self._lock.acquire(blocking=False):
+            print(f"  [Anna's Archive] Waiting for browser (another extraction in progress)...")
+            self._lock.acquire()
+        try:
             self._ensure_browser()
             context = self._browser.new_context(user_agent=self.BROWSER_UA)
             page = context.new_page()
@@ -413,11 +425,22 @@ class AnnasArchiveSource:
                     print(f"  [Anna's Archive] Trying server {server_id}...")
                     try:
                         page.goto(url, timeout=30000)
-                        page.wait_for_function(
-                            "() => !document.body.innerText.includes('Checking your browser')",
-                            timeout=15000,
-                        )
+                        # Wait for DDoS-Guard to resolve (takes ~6s)
+                        for _ in range(15):
+                            time.sleep(1)
+                            try:
+                                title = page.title()
+                                if title != "DDoS-Guard":
+                                    time.sleep(2)  # extra settle time after redirect
+                                    break
+                            except Exception:
+                                continue
+
                         html = page.content()
+                        if "Download from partner" not in html and "slow_download" not in html:
+                            print(f"  [Anna's Archive] Server {server_id}: no download link (page redirected)")
+                            continue
+
                         match = url_re.search(html)
                         if match:
                             direct_url = match.group(0)
@@ -431,7 +454,9 @@ class AnnasArchiveSource:
             finally:
                 context.close()
 
-        return None
+            return None
+        finally:
+            self._lock.release()
 
     def download(self, result: BookResult, output_path: str) -> bool:
         md5_hash = result.source_metadata.get("hash", "")
@@ -567,11 +592,19 @@ class InternetArchiveSource:
         return _download_file(result.download_url, output_path, source="Internet Archive")
 
 
+DOWNLOAD_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+}
+
+
 def _download_file(url: str, output_path: str, source: str, max_retries: int = 3) -> bool:
     """Download a file with retries and exponential backoff."""
     for attempt in range(max_retries):
         try:
-            resp = requests.get(url, stream=True, timeout=60, allow_redirects=True)
+            resp = requests.get(url, stream=True, timeout=(15, 120), headers=DOWNLOAD_HEADERS, allow_redirects=True)
 
             if resp.status_code in (429, 503):
                 wait = min(30 * (attempt + 1), 60)
@@ -581,9 +614,22 @@ def _download_file(url: str, output_path: str, source: str, max_retries: int = 3
 
             resp.raise_for_status()
 
+            total_size = int(resp.headers.get("content-length", 0))
+            downloaded = 0
+            last_report = time.time()
             with open(output_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
+                for chunk in resp.iter_content(chunk_size=65536):
                     f.write(chunk)
+                    downloaded += len(chunk)
+                    now = time.time()
+                    if now - last_report >= 10:
+                        mb = downloaded / 1024 / 1024
+                        if total_size:
+                            total_mb = total_size / 1024 / 1024
+                            print(f"  [{source}] {mb:.1f}/{total_mb:.1f} MB")
+                        else:
+                            print(f"  [{source}] {mb:.1f} MB downloaded")
+                        last_report = now
 
             file_size = os.path.getsize(output_path)
             if file_size == 0:

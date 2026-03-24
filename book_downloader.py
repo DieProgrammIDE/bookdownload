@@ -23,6 +23,7 @@ from sources import (
     LibGenSource,
     ZLibrarySource,
     _download_file,
+    rank_candidates,
     select_best,
 )
 
@@ -106,8 +107,6 @@ async def discover_isbn(
 
     existing = _file_exists_for_isbn(isbn, cache.directory.replace("/.cache", ""))
     if existing:
-        # Mark as already done so download phase skips it
-        cache.set(f"download:{isbn}", "downloaded")
         print(f"  [skip] Already on disk: {existing}")
         return []
 
@@ -184,17 +183,12 @@ async def download_isbn(
     cache: diskcache.Cache,
     output_dir: str,
 ) -> tuple[str, BookResult | None]:
-    """Download best match for isbn. Returns (status, selected_book)."""
-    download_key = f"download:{isbn}"
+    """Download best match for isbn. Returns (status, selected_book).
 
-    cached_status = cache.get(download_key)
-    if cached_status == "downloaded":
-        return "exists", None
-
-    existing = _file_exists_for_isbn(isbn, output_dir)
-    if existing:
-        cache.set(download_key, "downloaded")
-        print(f"  Already on disk: {existing}")
+    Skip condition: file already exists on disk. No cache-based skipping —
+    failed downloads are always retried on later runs.
+    """
+    if _file_exists_for_isbn(isbn, output_dir):
         return "exists", None
 
     discovery_key = f"discovery:{isbn}"
@@ -207,39 +201,39 @@ async def download_isbn(
     if not candidates:
         return "not_found", None
 
-    best = select_best(candidates)
-    if not best:
+    ranked = rank_candidates(candidates)
+    if not ranked:
         print(f"  No suitable format found among {len(candidates)} candidate(s)")
         return "not_found", None
 
-    print(f"  → \"{best.title}\" ({best.language}, {best.extension}, {best.size}) [{best.source}]")
+    for i, candidate in enumerate(ranked):
+        print(f"  → [{i+1}/{len(ranked)}] \"{candidate.title}\" ({candidate.extension}, {candidate.size}) [{candidate.source}]")
 
-    filename = make_output_filename(isbn, best)
-    output_path = os.path.join(output_dir, filename)
+        filename = make_output_filename(isbn, candidate)
+        output_path = os.path.join(output_dir, filename)
 
-    source = sources.get(best.source)
-    if source is None:
-        # Source not available in this run; try direct URL download
-        if best.download_url:
-            success = await asyncio.to_thread(_download_file, best.download_url, output_path, best.source)
+        source = sources.get(candidate.source)
+        if source is None:
+            if candidate.download_url:
+                success = await asyncio.to_thread(_download_file, candidate.download_url, output_path, candidate.source)
+            else:
+                print(f"  Source '{candidate.source}' unavailable and no URL cached")
+                continue
+        elif isinstance(source, ZLibrarySource):
+            success = await source.download(candidate, output_path)
         else:
-            print(f"  Source '{best.source}' unavailable and no URL cached")
-            cache.set(download_key, "failed")
-            return "failed", best
-    elif isinstance(source, ZLibrarySource):
-        success = await source.download(best, output_path)
-    else:
-        success = await asyncio.to_thread(source.download, best, output_path)
+            success = await asyncio.to_thread(source.download, candidate, output_path)
 
-    if success:
-        size = os.path.getsize(output_path)
-        print(f"  Saved: {filename} ({size:,} bytes)")
-        cache.set(download_key, "downloaded")
-        return "downloaded", best
-    else:
-        print(f"  Download failed")
-        cache.set(download_key, "failed")
-        return "failed", best
+        if success:
+            size = os.path.getsize(output_path)
+            print(f"  Saved: {filename} ({size:,} bytes)")
+            return "downloaded", candidate
+
+        if i < len(ranked) - 1:
+            print(f"  Trying next candidate...")
+
+    print(f"  All {len(ranked)} candidate(s) failed")
+    return "failed", ranked[0]
 
 
 async def run_download_phase(
@@ -250,20 +244,43 @@ async def run_download_phase(
     concurrency: int,
 ) -> tuple[dict, dict]:
     semaphore = asyncio.Semaphore(concurrency)
+    total = len(isbns)
+    progress = {"downloaded": 0, "exists": 0, "not_found": 0, "failed": 0, "done": 0}
+    start_time = asyncio.get_event_loop().time()
+
+    async def status_reporter():
+        """Print progress every 30 seconds."""
+        while progress["done"] < total:
+            await asyncio.sleep(30)
+            if progress["done"] >= total:
+                break
+            elapsed = asyncio.get_event_loop().time() - start_time
+            print(
+                f"\n--- Status [{progress['done']}/{total}] {elapsed:.0f}s elapsed "
+                f"| downloaded: {progress['downloaded']} "
+                f"| exists: {progress['exists']} "
+                f"| failed: {progress['failed']} "
+                f"| not_found: {progress['not_found']} ---"
+            )
 
     async def bounded(isbn: str, idx: int, total: int):
         async with semaphore:
             print(f"\n[Download {idx}/{total}] {isbn}")
             status, selected = await download_isbn(isbn, sources, cache, output_dir)
+            progress[status] = progress.get(status, 0) + 1
+            progress["done"] += 1
             return isbn, status, selected
 
-    tasks = [bounded(isbn, i + 1, len(isbns)) for i, isbn in enumerate(isbns)]
+    reporter = asyncio.create_task(status_reporter())
+    tasks = [bounded(isbn, i + 1, total) for i, isbn in enumerate(isbns)]
     results = await asyncio.gather(*tasks, return_exceptions=True)
+    reporter.cancel()
 
     stats = {"downloaded": 0, "exists": 0, "not_found": 0, "failed": 0}
     results_log = {}
     for r in results:
         if isinstance(r, Exception):
+            print(f"  [error] Download exception: {r}")
             stats["failed"] += 1
         else:
             isbn, status, selected = r
