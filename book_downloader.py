@@ -7,11 +7,19 @@ import json
 import os
 import re
 import sys
-import time
 
+import diskcache
 from dotenv import load_dotenv
 
-from sources import BookResult, LibGenSource, ZLibrarySource
+from sources import (
+    AnnasArchiveSource,
+    BookResult,
+    InternetArchiveSource,
+    LibGenSource,
+    ZLibrarySource,
+    _download_file,
+    select_best,
+)
 
 
 def load_isbns(filepath: str) -> list[str]:
@@ -23,7 +31,6 @@ def load_isbns(filepath: str) -> list[str]:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            # Strip hyphens and spaces
             isbn = re.sub(r"[\s-]", "", line)
             if not re.match(r"^\d{10}(\d{3})?$", isbn):
                 print(f"  Warning: Skipping invalid ISBN on line {line_num}: {line}")
@@ -39,61 +46,7 @@ def sanitize_filename(name: str) -> str:
     name = re.sub(r'[<>:"/\\|?*]', "", name)
     name = re.sub(r"\s+", "_", name)
     name = name.strip("_.")
-    return name[:100]  # cap length
-
-
-def select_best(candidates: list[BookResult], any_format: bool = False) -> BookResult | None:
-    """Select the best book match from candidates."""
-    if not candidates:
-        return None
-
-    def score(book: BookResult) -> tuple:
-        is_german = book.language in ("german", "deutsch", "de", "ger", "deu")
-        is_pdf = book.extension == "pdf"
-        allowed_format = is_pdf or (any_format and book.extension in ("epub", "djvu", "mobi"))
-
-        if not allowed_format and not is_pdf:
-            return (0, 0, 0, 0)
-
-        # Parse size for comparison (e.g. "5 Mb" -> 5000000)
-        size_bytes = _parse_size(book.size)
-
-        if is_german and is_pdf:
-            return (4, size_bytes, 1 if is_german else 0, 1 if is_pdf else 0)
-        elif is_german and allowed_format:
-            return (3, size_bytes, 1, 0)
-        elif is_pdf:
-            return (2, size_bytes, 0, 1)
-        elif allowed_format:
-            return (1, size_bytes, 0, 0)
-        return (0, 0, 0, 0)
-
-    scored = [(score(c), c) for c in candidates]
-    scored = [(s, c) for s, c in scored if s[0] > 0]
-
-    if not scored:
-        # If no candidate matched format criteria, fall back to first candidate
-        if any_format and candidates:
-            return candidates[0]
-        # Try returning any PDF
-        pdfs = [c for c in candidates if c.extension == "pdf"]
-        return pdfs[0] if pdfs else candidates[0]
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return scored[0][1]
-
-
-def _parse_size(size_str: str) -> int:
-    """Parse size string like '5 Mb' to bytes."""
-    if not size_str:
-        return 0
-    m = re.match(r"([\d.]+)\s*(kb|mb|gb|bytes?)?", size_str.lower())
-    if not m:
-        return 0
-    val = float(m.group(1))
-    unit = m.group(2) or "bytes"
-    multipliers = {"bytes": 1, "byte": 1, "kb": 1024, "mb": 1024**2, "gb": 1024**3}
-    return int(val * multipliers.get(unit, 1))
+    return name[:100]
 
 
 def make_output_filename(isbn: str, book: BookResult) -> str:
@@ -103,78 +56,208 @@ def make_output_filename(isbn: str, book: BookResult) -> str:
     return f"{isbn}_{title_part}.{ext}"
 
 
-async def process_isbn(
+def _file_exists_for_isbn(isbn: str, output_dir: str) -> str | None:
+    """Return filename if a file for this ISBN already exists on disk, else None."""
+    try:
+        for f in os.listdir(output_dir):
+            if f.startswith(isbn + "_"):
+                return f
+    except OSError:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: Discovery
+# ---------------------------------------------------------------------------
+
+async def discover_isbn(
     isbn: str,
-    libgen: LibGenSource | None,
-    zlib: ZLibrarySource | None,
+    sources: dict,
+    cache: diskcache.Cache,
+) -> list[BookResult]:
+    """Search all sources for a single ISBN. Returns list of BookResult candidates."""
+    cache_key = f"discovery:{isbn}"
+
+    cached = cache.get(cache_key)
+    if cached is not None:
+        candidates = [BookResult.from_dict(d) for d in cached]
+        print(f"  [cache] {len(candidates)} candidate(s) for {isbn}")
+        return candidates
+
+    existing = _file_exists_for_isbn(isbn, cache.directory.replace("/.cache", ""))
+    if existing:
+        # Mark as already done so download phase skips it
+        cache.set(f"download:{isbn}", "downloaded")
+        print(f"  [skip] Already on disk: {existing}")
+        return []
+
+    candidates: list[BookResult] = []
+
+    async def search_sync(name: str, source):
+        try:
+            results = await asyncio.to_thread(source.search_isbn, isbn)
+            return name, results
+        except Exception as e:
+            print(f"  [{name}] Search error: {e}")
+            return name, []
+
+    async def search_async(name: str, source):
+        try:
+            results = await source.search_isbn(isbn)
+            return name, results
+        except Exception as e:
+            print(f"  [{name}] Search error: {e}")
+            return name, []
+
+    tasks = []
+    for name, source in sources.items():
+        if isinstance(source, ZLibrarySource):
+            tasks.append(search_async(name, source))
+        else:
+            tasks.append(search_sync(name, source))
+
+    task_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for r in task_results:
+        if isinstance(r, Exception):
+            print(f"  [error] {r}")
+            continue
+        name, books = r
+        if books:
+            print(f"  [{name}] {len(books)} result(s)")
+            candidates.extend(books)
+
+    cache.set(cache_key, [c.to_dict() for c in candidates])
+    return candidates
+
+
+async def run_discovery_phase(
+    isbns: list[str],
+    sources: dict,
+    cache: diskcache.Cache,
+    concurrency: int,
+) -> dict:
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def bounded(isbn: str, idx: int, total: int):
+        async with semaphore:
+            print(f"\n[Discovery {idx}/{total}] {isbn}")
+            return isbn, await discover_isbn(isbn, sources, cache)
+
+    tasks = [bounded(isbn, i + 1, len(isbns)) for i, isbn in enumerate(isbns)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    found = sum(1 for r in results if not isinstance(r, Exception) and r[1])
+    not_found = sum(1 for r in results if not isinstance(r, Exception) and not r[1])
+    errors = sum(1 for r in results if isinstance(r, Exception))
+    print(f"\nDiscovery: {found} found, {not_found} not found, {errors} errors")
+    return {"found": found, "not_found": not_found, "errors": errors}
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Download
+# ---------------------------------------------------------------------------
+
+async def download_isbn(
+    isbn: str,
+    sources: dict,
+    cache: diskcache.Cache,
     output_dir: str,
     any_format: bool,
-    delay: float,
 ) -> str:
-    """Process a single ISBN. Returns status: 'downloaded', 'exists', 'not_found', 'failed'."""
+    """Download best match for isbn. Returns status string."""
+    download_key = f"download:{isbn}"
 
-    # Check if already downloaded
-    for f in os.listdir(output_dir):
-        if f.startswith(isbn + "_"):
-            print(f"  Already downloaded: {f}")
-            return "exists"
+    cached_status = cache.get(download_key)
+    if cached_status == "downloaded":
+        return "exists"
 
-    candidates = []
+    existing = _file_exists_for_isbn(isbn, output_dir)
+    if existing:
+        cache.set(download_key, "downloaded")
+        print(f"  Already on disk: {existing}")
+        return "exists"
 
-    # 1. Try LibGen first
-    if libgen:
-        print(f"  Searching LibGen...")
-        try:
-            results = libgen.search_isbn(isbn)
-            if results:
-                print(f"  LibGen: found {len(results)} result(s)")
-                candidates.extend(results)
-        except Exception as e:
-            print(f"  LibGen search error: {e}")
-
-    # 2. Try Z-Library as fallback
-    if not candidates and zlib:
-        print(f"  Searching Z-Library...")
-        try:
-            results = await zlib.search_isbn(isbn)
-            if results:
-                print(f"  Z-Library: found {len(results)} result(s)")
-                candidates.extend(results)
-        except Exception as e:
-            print(f"  Z-Library search error: {e}")
-
-    if not candidates:
-        print(f"  Not found in any source")
+    discovery_key = f"discovery:{isbn}"
+    cached_discovery = cache.get(discovery_key)
+    if cached_discovery is None:
+        print(f"  No discovery results (run discovery phase first)")
         return "not_found"
 
-    # Select best match
+    candidates = [BookResult.from_dict(d) for d in cached_discovery]
+    if not candidates:
+        return "not_found"
+
     best = select_best(candidates, any_format=any_format)
     if not best:
-        print(f"  No suitable format found")
+        print(f"  No suitable format found among {len(candidates)} candidate(s)")
         return "not_found"
 
-    print(f"  Selected: \"{best.title}\" by {best.authors} ({best.language}, {best.extension}, {best.size}) [{best.source}]")
+    print(f"  → \"{best.title}\" ({best.language}, {best.extension}, {best.size}) [{best.source}]")
 
     filename = make_output_filename(isbn, best)
     output_path = os.path.join(output_dir, filename)
 
-    # Download
-    print(f"  Downloading...")
-    if best.source == "libgen":
-        success = libgen.download(best, output_path)
-    elif best.source == "zlibrary":
-        success = await zlib.download(best, output_path)
+    source = sources.get(best.source)
+    if source is None:
+        # Source not available in this run; try direct URL download
+        if best.download_url:
+            success = await asyncio.to_thread(_download_file, best.download_url, output_path, best.source)
+        else:
+            print(f"  Source '{best.source}' unavailable and no URL cached")
+            cache.set(download_key, "failed")
+            return "failed"
+    elif isinstance(source, ZLibrarySource):
+        success = await source.download(best, output_path)
     else:
-        success = False
+        success = await asyncio.to_thread(source.download, best, output_path)
 
     if success:
-        file_size = os.path.getsize(output_path)
-        print(f"  Saved: {filename} ({file_size:,} bytes)")
+        size = os.path.getsize(output_path)
+        print(f"  Saved: {filename} ({size:,} bytes)")
+        cache.set(download_key, "downloaded")
         return "downloaded"
     else:
         print(f"  Download failed")
+        cache.set(download_key, "failed")
         return "failed"
 
+
+async def run_download_phase(
+    isbns: list[str],
+    sources: dict,
+    cache: diskcache.Cache,
+    output_dir: str,
+    any_format: bool,
+    concurrency: int,
+) -> tuple[dict, dict]:
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def bounded(isbn: str, idx: int, total: int):
+        async with semaphore:
+            print(f"\n[Download {idx}/{total}] {isbn}")
+            return isbn, await download_isbn(isbn, sources, cache, output_dir, any_format)
+
+    tasks = [bounded(isbn, i + 1, len(isbns)) for i, isbn in enumerate(isbns)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    stats = {"downloaded": 0, "exists": 0, "not_found": 0, "failed": 0}
+    results_log = {}
+    for r in results:
+        if isinstance(r, Exception):
+            stats["failed"] += 1
+        else:
+            isbn, status = r
+            stats[status] = stats.get(status, 0) + 1
+            results_log[isbn] = status
+
+    return stats, results_log
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 async def main():
     parser = argparse.ArgumentParser(
@@ -182,16 +265,32 @@ async def main():
     )
     parser.add_argument("isbn_file", help="Path to file with ISBNs (one per line)")
     parser.add_argument("-o", "--output-dir", default="downloads", help="Output directory (default: downloads/)")
-    parser.add_argument("--delay", type=float, default=3.0, help="Seconds between requests (default: 3.0)")
     parser.add_argument("--libgen-mirror", default="li", help="LibGen mirror TLD: li, bz, gs (default: li)")
-    parser.add_argument("--no-zlibrary", action="store_true", help="Skip Z-Library entirely")
     parser.add_argument("--any-format", action="store_true", help="Accept EPUB/DJVU if no PDF available")
+
+    # Source toggles
+    parser.add_argument("--no-libgen", action="store_true", help="Skip LibGen")
+    parser.add_argument("--no-zlibrary", action="store_true", help="Skip Z-Library")
+    parser.add_argument("--no-annas", action="store_true", help="Skip Anna's Archive")
+    parser.add_argument("--no-internet-archive", action="store_true", help="Skip Internet Archive")
+
+    # Cache
+    parser.add_argument("--clear-cache", action="store_true", help="Clear cache and start fresh")
+
+    # Phase control
+    parser.add_argument("--discovery-only", action="store_true", help="Run discovery phase only")
+    parser.add_argument("--download-only", action="store_true", help="Run download phase only (requires cached discovery)")
+
+    # Concurrency
+    parser.add_argument("--discovery-concurrency", type=int, default=10,
+                        help="Max parallel ISBN searches during discovery (default: 10)")
+    parser.add_argument("--download-concurrency", type=int, default=3,
+                        help="Max parallel downloads (default: 3)")
+
     args = parser.parse_args()
 
-    # Load .env for Z-Library credentials
     load_dotenv()
 
-    # Load ISBNs
     if not os.path.isfile(args.isbn_file):
         print(f"Error: ISBN file not found: {args.isbn_file}")
         sys.exit(1)
@@ -203,90 +302,98 @@ async def main():
 
     print(f"Loaded {len(isbns)} ISBN(s)")
 
-    # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
+    cache_dir = os.path.join(args.output_dir, ".cache")
+    cache = diskcache.Cache(cache_dir)
+
+    if args.clear_cache:
+        cache.clear()
+        print("Cache cleared.")
 
     # Initialize sources
-    libgen = None
-    try:
-        libgen = LibGenSource(mirror=args.libgen_mirror)
-        print(f"LibGen initialized (mirror: .{args.libgen_mirror})")
-    except Exception as e:
-        print(f"Warning: LibGen initialization failed: {e}")
+    sources: dict = {}
 
-    zlib = None
+    if not args.no_libgen:
+        try:
+            sources["libgen"] = LibGenSource(mirror=args.libgen_mirror)
+            print(f"LibGen initialized (mirror: .{args.libgen_mirror})")
+        except Exception as e:
+            print(f"Warning: LibGen init failed: {e}")
+
+    if not args.no_annas:
+        sources["annas_archive"] = AnnasArchiveSource()
+        print("Anna's Archive initialized")
+
+    if not args.no_internet_archive:
+        sources["internet_archive"] = InternetArchiveSource()
+        print("Internet Archive initialized")
+
     if not args.no_zlibrary:
         zl_email = os.getenv("ZLIBRARY_EMAIL")
         zl_password = os.getenv("ZLIBRARY_PASSWORD")
         if zl_email and zl_password:
             zlib = ZLibrarySource(zl_email, zl_password)
-            # Check limits
             limits = await zlib.check_limits()
             if limits:
                 print(f"Z-Library initialized (limits: {limits})")
             else:
-                print("Z-Library initialized (could not check limits)")
+                print("Z-Library initialized")
+            sources["zlibrary"] = zlib
         else:
-            print("Z-Library: no credentials found (set ZLIBRARY_EMAIL and ZLIBRARY_PASSWORD in .env)")
-    else:
-        print("Z-Library: disabled via --no-zlibrary")
+            print("Z-Library: no credentials found (set ZLIBRARY_EMAIL/ZLIBRARY_PASSWORD in .env)")
 
-    if not libgen and not zlib:
-        print("Error: No sources available. Cannot proceed.")
+    if not sources:
+        print("Error: No sources available.")
         sys.exit(1)
 
-    # Process ISBNs
-    stats = {"downloaded": 0, "exists": 0, "not_found": 0, "failed": 0}
+    # Phase 1: Discovery
+    if not args.download_only:
+        print(f"\n{'='*60}")
+        print(f"Phase 1: Discovery  [{len(isbns)} ISBNs, concurrency={args.discovery_concurrency}]")
+        print(f"{'='*60}")
+        await run_discovery_phase(isbns, sources, cache, args.discovery_concurrency)
+
+    # Phase 2: Download
+    stats = {}
     results_log = {}
+    if not args.discovery_only:
+        print(f"\n{'='*60}")
+        print(f"Phase 2: Download  [concurrency={args.download_concurrency}]")
+        print(f"{'='*60}")
+        stats, results_log = await run_download_phase(
+            isbns, sources, cache, args.output_dir, args.any_format, args.download_concurrency
+        )
 
-    print(f"\nProcessing {len(isbns)} ISBN(s)...\n")
+        not_found = [isbn for isbn, s in results_log.items() if s == "not_found"]
+        failed = [isbn for isbn, s in results_log.items() if s == "failed"]
 
-    for i, isbn in enumerate(isbns, 1):
-        print(f"[{i}/{len(isbns)}] ISBN: {isbn}")
-        status = await process_isbn(isbn, libgen, zlib, args.output_dir, args.any_format, args.delay)
-        stats[status] += 1
-        results_log[isbn] = status
+        print(f"\n{'='*60}")
+        print(f"Summary:")
+        print(f"  Downloaded:      {stats.get('downloaded', 0)}")
+        print(f"  Already existed: {stats.get('exists', 0)}")
+        print(f"  Not found:       {stats.get('not_found', 0)}")
+        print(f"  Failed:          {stats.get('failed', 0)}")
+        print(f"  Total:           {len(isbns)}")
 
-        # Delay between requests (skip after last)
-        if i < len(isbns) and status not in ("exists",):
-            time.sleep(args.delay)
+        if not_found:
+            print(f"\nNot found ({len(not_found)}):")
+            for isbn in not_found:
+                print(f"  {isbn}")
+        if failed:
+            print(f"\nFailed ({len(failed)}):")
+            for isbn in failed:
+                print(f"  {isbn}")
+
+        results_path = os.path.join(args.output_dir, "results.json")
+        with open(results_path, "w") as f:
+            json.dump({"stats": stats, "results": results_log,
+                       "not_found": not_found, "failed": failed}, f, indent=2)
+        print(f"\nResults written to {results_path}")
 
     # Cleanup
-    if zlib:
-        await zlib.close()
-
-    # Summary
-    print(f"\n{'='*50}")
-    print(f"Summary:")
-    print(f"  Downloaded: {stats['downloaded']}")
-    print(f"  Already existed: {stats['exists']}")
-    print(f"  Not found: {stats['not_found']}")
-    print(f"  Failed: {stats['failed']}")
-    print(f"  Total: {len(isbns)}")
-
-    not_found = [isbn for isbn, s in results_log.items() if s == "not_found"]
-    failed = [isbn for isbn, s in results_log.items() if s == "failed"]
-
-    if not_found:
-        print(f"\nISBNs not found ({len(not_found)}):")
-        for isbn in not_found:
-            print(f"  {isbn}")
-
-    if failed:
-        print(f"\nFailed downloads ({len(failed)}):")
-        for isbn in failed:
-            print(f"  {isbn}")
-
-    # Write results.json
-    results_path = os.path.join(args.output_dir, "results.json")
-    with open(results_path, "w") as f:
-        json.dump({
-            "stats": stats,
-            "results": results_log,
-            "not_found": not_found,
-            "failed": failed,
-        }, f, indent=2)
-    print(f"\nResults written to {results_path}")
+    if "zlibrary" in sources:
+        await sources["zlibrary"].close()
+    cache.close()
 
 
 if __name__ == "__main__":
