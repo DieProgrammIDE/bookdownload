@@ -57,10 +57,12 @@ def download_file(
     source: str,
     progress_cb=None,
     max_retries: int = 5,
+    max_download_time: int = 1800,
 ) -> tuple[bool, str | None]:
     """Download a file. Returns (success, error_message).
 
     progress_cb(downloaded_bytes, total_bytes) is called every ~10s.
+    max_download_time caps total wall-clock time (default 30 min).
     """
     langfuse = get_client()
 
@@ -92,15 +94,29 @@ def download_file(
                     allow_redirects=True,
                 )
 
+                # Non-retryable HTTP errors — fail immediately
+                if resp.status_code in (401, 403, 404):
+                    error = f"{resp.status_code} {resp.reason} for url: {url}"
+                    attempt_obs.update(
+                        output={"status_code": resp.status_code, "error": error},
+                        level="ERROR", status_message=error,
+                    )
+                    attempt_cm.__exit__(None, None, None)
+                    flush_tracing()
+                    file_obs.update(output={"success": False, "error": error, "attempts": attempt + 1})
+                    flush_tracing()
+                    return False, error
+
                 if resp.status_code in (429, 503):
                     wait = min(30 * 2**attempt, 300)
+                    msg = f"Rate limited ({resp.status_code}), waiting {wait}s"
                     print(
-                        f"  [{source}] Rate limited "
-                        f"(attempt {attempt + 1}/{max_retries}), waiting {wait}s..."
+                        f"  [{source}] {msg} "
+                        f"(attempt {attempt + 1}/{max_retries})..."
                     )
                     attempt_obs.update(
                         output={"status_code": resp.status_code, "action": "rate_limited", "wait_s": wait},
-                        level="WARNING",
+                        level="WARNING", status_message=msg,
                     )
                     attempt_cm.__exit__(None, None, None)
                     flush_tracing()
@@ -118,13 +134,30 @@ def download_file(
                         f.write(chunk)
                         downloaded += len(chunk)
                         now = time.time()
+
+                        # Total download timeout
+                        if now - download_start > max_download_time:
+                            if os.path.exists(output_path):
+                                os.remove(output_path)
+                            error = f"download timeout ({max_download_time}s)"
+                            attempt_obs.update(
+                                output={"error": error, "downloaded_mb": round(downloaded / 1048576, 2)},
+                                level="ERROR", status_message=error,
+                            )
+                            attempt_cm.__exit__(None, None, None)
+                            flush_tracing()
+                            file_obs.update(output={"success": False, "error": error})
+                            flush_tracing()
+                            return False, error
+
                         if progress_cb and now - last_report >= 10:
                             progress_cb(downloaded, total_size)
                             last_report = now
                         if now - last_span_update >= 30:
                             elapsed = now - download_start
                             speed = (downloaded / 1048576) / elapsed if elapsed > 0 else 0
-                            attempt_obs.update(metadata={
+                            attempt_obs.update(output={
+                                "status": "downloading",
                                 "downloaded_mb": round(downloaded / 1048576, 2),
                                 "total_mb": round(total_size / 1048576, 2) if total_size else None,
                                 "speed_mbps": round(speed, 2),
@@ -136,7 +169,10 @@ def download_file(
                 file_size = os.path.getsize(output_path)
                 if file_size == 0:
                     os.remove(output_path)
-                    attempt_obs.update(output={"status_code": resp.status_code, "error": "empty file"}, level="ERROR")
+                    attempt_obs.update(
+                        output={"status_code": resp.status_code, "error": "empty file"},
+                        level="ERROR", status_message="downloaded file is empty",
+                    )
                     attempt_cm.__exit__(None, None, None)
                     flush_tracing()
                     file_obs.update(output={"success": False, "error": "downloaded file is empty", "attempts": attempt + 1})
@@ -149,14 +185,22 @@ def download_file(
                     if header != b"%PDF-":
                         os.remove(output_path)
                         err = f"not a valid PDF (header: {header!r})"
-                        attempt_obs.update(output={"status_code": resp.status_code, "error": err}, level="ERROR")
+                        attempt_obs.update(
+                            output={"status_code": resp.status_code, "error": err},
+                            level="ERROR", status_message=err,
+                        )
                         attempt_cm.__exit__(None, None, None)
                         flush_tracing()
                         file_obs.update(output={"success": False, "error": err, "attempts": attempt + 1})
                         flush_tracing()
                         return False, err
 
-                attempt_obs.update(output={"status_code": resp.status_code, "downloaded_bytes": downloaded, "total_bytes": total_size})
+                attempt_obs.update(output={
+                    "status": "completed",
+                    "status_code": resp.status_code,
+                    "downloaded_bytes": downloaded,
+                    "total_bytes": total_size,
+                })
                 attempt_cm.__exit__(None, None, None)
                 flush_tracing()
                 elapsed = time.time() - download_start
@@ -172,8 +216,24 @@ def download_file(
                 return True, None
 
             except requests.exceptions.RequestException as e:
+                error_str = str(e)
+
+                # IncompleteRead — bail immediately, caller will rotate server
+                if "IncompleteRead" in error_str:
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+                    attempt_obs.update(
+                        output={"error": error_str, "action": "incomplete_read_bail"},
+                        level="ERROR", status_message=error_str,
+                    )
+                    attempt_cm.__exit__(None, None, None)
+                    flush_tracing()
+                    file_obs.update(output={"success": False, "error": error_str, "attempts": attempt + 1})
+                    flush_tracing()
+                    return False, error_str
+
                 action = "retry" if attempt < max_retries - 1 else "give_up"
-                attempt_obs.update(output={"error": str(e), "action": action}, level="ERROR", status_message=str(e))
+                attempt_obs.update(output={"error": error_str, "action": action}, level="ERROR", status_message=error_str)
                 attempt_cm.__exit__(None, None, None)
                 flush_tracing()
                 if attempt < max_retries - 1:
@@ -185,11 +245,13 @@ def download_file(
                     )
                     time.sleep(wait)
                 else:
-                    file_obs.update(output={"success": False, "error": str(e), "attempts": attempt + 1})
+                    file_obs.update(output={"success": False, "error": error_str, "attempts": attempt + 1})
                     flush_tracing()
-                    return False, str(e)
+                    return False, error_str
 
-        file_obs.update(output={"success": False, "error": "max retries exceeded", "attempts": max_retries})
+        file_obs.update(output={
+            "success": False, "error": "max retries exceeded", "attempts": max_retries,
+        })
         flush_tracing()
         return False, "max retries exceeded"
 
@@ -214,8 +276,8 @@ async def _do_download(isbn, url, candidate, output_dir, download_metrics):
         else:
             log(_isbn, f"{mb:.1f} MB")
 
-    # Use max_retries=7 for Anna's Archive, 5 for others
-    retries = 7 if candidate.source == "annas_archive" else 5
+    # Anna's Archive URLs expire fast — keep retries low, server rotation handles the rest
+    retries = 2 if candidate.source == "annas_archive" else 5
 
     ctx = contextvars.copy_context()
     success, error = await asyncio.to_thread(
@@ -259,18 +321,25 @@ async def download_one(
 
         if candidate.source == "annas_archive" and candidate.source_metadata.get("hash"):
             annas = sources["annas_archive"]
-            server = annas.next_server()
-            async with annas.server_sem(server):
-                log(isbn, f"{tag} extracting URL (server {server})...")
-                url = await annas.extract_url(
-                    candidate.source_metadata["hash"], server,
-                )
-                if not url:
-                    log(isbn, f"{tag} no download link")
-                    continue
-                success, error = await _do_download(
-                    isbn, url, candidate, output_dir, download_metrics,
-                )
+            md5_hash = candidate.source_metadata["hash"]
+            max_server_tries = len(annas.SERVERS)
+
+            success, error = False, "no servers tried"
+            for server_try in range(max_server_tries):
+                server = annas.next_server()
+                async with annas.server_sem(server):
+                    log(isbn, f"{tag} extracting URL (server {server})...")
+                    url = await annas.extract_url(md5_hash, server)
+                    if not url:
+                        log(isbn, f"{tag} no download link from server {server}")
+                        continue
+                    success, error = await _do_download(
+                        isbn, url, candidate, output_dir, download_metrics,
+                    )
+                if success:
+                    break
+                log(isbn, f"{tag} server {server} failed: {error}, trying next server...")
+                continue  # rotate to next server with fresh URL
         else:
             url = candidate.download_url
             if not url:
@@ -302,6 +371,7 @@ async def download_one(
             "candidates_sources": [c.source for c in ranked],
         },
         level="WARNING",
+        status_message=f"all {len(ranked)} candidates failed",
     )
     flush_tracing()
     return "failed", ranked[0] if ranked else None

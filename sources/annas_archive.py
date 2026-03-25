@@ -265,6 +265,7 @@ class AnnasArchiveSource:
                 langfuse.update_current_span(
                     output={"success": False, "reason": "no download content on page"},
                     level="WARNING",
+                    status_message="no download content on page",
                 )
                 flush_tracing()
                 return None
@@ -281,6 +282,7 @@ class AnnasArchiveSource:
             langfuse.update_current_span(
                 output={"success": False, "reason": "no URL match in HTML"},
                 level="WARNING",
+                status_message="no URL match in HTML",
             )
             flush_tracing()
         except Exception as e:
