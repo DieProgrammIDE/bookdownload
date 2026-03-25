@@ -51,7 +51,6 @@ def file_exists_for_isbn(isbn: str, output_dir: str) -> str | None:
 # File download
 # ---------------------------------------------------------------------------
 
-@observe(name="download-file", capture_input=False, capture_output=False)
 def download_file(
     url: str,
     output_path: str,
@@ -64,132 +63,139 @@ def download_file(
     progress_cb(downloaded_bytes, total_bytes) is called every ~10s.
     """
     langfuse = get_client()
-    langfuse.update_current_span(
+
+    # Explicit span management (not @observe) so it's visible immediately
+    file_cm = langfuse.start_as_current_observation(
+        as_type="span",
+        name="download-file",
         input={"url": url, "source": source, "max_retries": max_retries},
     )
+    file_obs = file_cm.__enter__()
     flush_tracing()
     download_start = time.time()
 
-    for attempt in range(max_retries):
-        attempt_cm = langfuse.start_as_current_observation(
-            as_type="span",
-            name=f"download-attempt-{attempt + 1}",
-            input={"attempt": attempt + 1, "max_retries": max_retries},
-        )
-        attempt_obs = attempt_cm.__enter__()
-        flush_tracing()  # visible in Langfuse immediately while in-progress
-        try:
-            resp = requests.get(
-                url,
-                stream=True,
-                timeout=(15, 120),
-                headers=DOWNLOAD_HEADERS,
-                allow_redirects=True,
+    try:
+        for attempt in range(max_retries):
+            attempt_cm = langfuse.start_as_current_observation(
+                as_type="span",
+                name=f"download-attempt-{attempt + 1}",
+                input={"attempt": attempt + 1, "max_retries": max_retries},
             )
-
-            if resp.status_code in (429, 503):
-                wait = min(30 * 2**attempt, 300)
-                print(
-                    f"  [{source}] Rate limited "
-                    f"(attempt {attempt + 1}/{max_retries}), waiting {wait}s..."
+            attempt_obs = attempt_cm.__enter__()
+            flush_tracing()
+            try:
+                resp = requests.get(
+                    url,
+                    stream=True,
+                    timeout=(15, 120),
+                    headers=DOWNLOAD_HEADERS,
+                    allow_redirects=True,
                 )
-                attempt_obs.update(
-                    output={"status_code": resp.status_code, "action": "rate_limited", "wait_s": wait},
-                    level="WARNING",
-                )
-                attempt_cm.__exit__(None, None, None)
-                flush_tracing()
-                time.sleep(wait)
-                continue
 
-            resp.raise_for_status()
+                if resp.status_code in (429, 503):
+                    wait = min(30 * 2**attempt, 300)
+                    print(
+                        f"  [{source}] Rate limited "
+                        f"(attempt {attempt + 1}/{max_retries}), waiting {wait}s..."
+                    )
+                    attempt_obs.update(
+                        output={"status_code": resp.status_code, "action": "rate_limited", "wait_s": wait},
+                        level="WARNING",
+                    )
+                    attempt_cm.__exit__(None, None, None)
+                    flush_tracing()
+                    time.sleep(wait)
+                    continue
 
-            total_size = int(resp.headers.get("content-length", 0))
-            downloaded = 0
-            last_report = time.time()
-            last_span_update = time.time()
-            with open(output_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=65536):
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    now = time.time()
-                    if progress_cb and now - last_report >= 10:
-                        progress_cb(downloaded, total_size)
-                        last_report = now
-                    # Live progress on the parent download-file span (every 30s)
-                    if now - last_span_update >= 30:
-                        elapsed = now - download_start
-                        speed = (downloaded / 1048576) / elapsed if elapsed > 0 else 0
-                        langfuse.update_current_span(
-                            metadata={
+                resp.raise_for_status()
+
+                total_size = int(resp.headers.get("content-length", 0))
+                downloaded = 0
+                last_report = time.time()
+                last_span_update = time.time()
+                with open(output_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        now = time.time()
+                        if progress_cb and now - last_report >= 10:
+                            progress_cb(downloaded, total_size)
+                            last_report = now
+                        if now - last_span_update >= 30:
+                            elapsed = now - download_start
+                            speed = (downloaded / 1048576) / elapsed if elapsed > 0 else 0
+                            attempt_obs.update(metadata={
                                 "downloaded_mb": round(downloaded / 1048576, 2),
                                 "total_mb": round(total_size / 1048576, 2) if total_size else None,
                                 "speed_mbps": round(speed, 2),
                                 "elapsed_s": round(elapsed, 1),
-                            },
-                        )
-                        flush_tracing()
-                        last_span_update = now
+                            })
+                            flush_tracing()
+                            last_span_update = now
 
-            file_size = os.path.getsize(output_path)
-            if file_size == 0:
-                os.remove(output_path)
-                attempt_obs.update(output={"status_code": resp.status_code, "error": "empty file"}, level="ERROR")
-                attempt_cm.__exit__(None, None, None)
-                flush_tracing()
-                langfuse.update_current_span(output={"success": False, "error": "downloaded file is empty", "attempts": attempt + 1})
-                flush_tracing()
-                return False, "downloaded file is empty"
-
-            if output_path.lower().endswith(".pdf"):
-                with open(output_path, "rb") as f:
-                    header = f.read(5)
-                if header != b"%PDF-":
+                file_size = os.path.getsize(output_path)
+                if file_size == 0:
                     os.remove(output_path)
-                    err = f"not a valid PDF (header: {header!r})"
-                    attempt_obs.update(output={"status_code": resp.status_code, "error": err}, level="ERROR")
+                    attempt_obs.update(output={"status_code": resp.status_code, "error": "empty file"}, level="ERROR")
                     attempt_cm.__exit__(None, None, None)
                     flush_tracing()
-                    langfuse.update_current_span(output={"success": False, "error": err, "attempts": attempt + 1})
+                    file_obs.update(output={"success": False, "error": "downloaded file is empty", "attempts": attempt + 1})
                     flush_tracing()
-                    return False, err
+                    return False, "downloaded file is empty"
 
-            attempt_obs.update(output={"status_code": resp.status_code, "downloaded_bytes": downloaded, "total_bytes": total_size})
-            attempt_cm.__exit__(None, None, None)
-            flush_tracing()
-            elapsed = time.time() - download_start
-            speed = (file_size / 1048576) / elapsed if elapsed > 0 else 0
-            langfuse.update_current_span(output={
-                "success": True,
-                "attempts": attempt + 1,
-                "file_size_mb": round(file_size / 1048576, 2),
-                "duration_s": round(elapsed, 1),
-                "avg_speed_mbps": round(speed, 2),
-            })
-            flush_tracing()
-            return True, None
+                if output_path.lower().endswith(".pdf"):
+                    with open(output_path, "rb") as f:
+                        header = f.read(5)
+                    if header != b"%PDF-":
+                        os.remove(output_path)
+                        err = f"not a valid PDF (header: {header!r})"
+                        attempt_obs.update(output={"status_code": resp.status_code, "error": err}, level="ERROR")
+                        attempt_cm.__exit__(None, None, None)
+                        flush_tracing()
+                        file_obs.update(output={"success": False, "error": err, "attempts": attempt + 1})
+                        flush_tracing()
+                        return False, err
 
-        except requests.exceptions.RequestException as e:
-            action = "retry" if attempt < max_retries - 1 else "give_up"
-            attempt_obs.update(output={"error": str(e), "action": action}, level="ERROR", status_message=str(e))
-            attempt_cm.__exit__(None, None, None)
-            flush_tracing()
-            if attempt < max_retries - 1:
-                wait = min(5 * 2**attempt, 120)
-                print(
-                    f"  [{source}] Download error "
-                    f"(attempt {attempt + 1}/{max_retries}): {e}, "
-                    f"retrying in {wait}s..."
-                )
-                time.sleep(wait)
-            else:
-                langfuse.update_current_span(output={"success": False, "error": str(e), "attempts": attempt + 1})
+                attempt_obs.update(output={"status_code": resp.status_code, "downloaded_bytes": downloaded, "total_bytes": total_size})
+                attempt_cm.__exit__(None, None, None)
                 flush_tracing()
-                return False, str(e)
+                elapsed = time.time() - download_start
+                speed = (file_size / 1048576) / elapsed if elapsed > 0 else 0
+                file_obs.update(output={
+                    "success": True,
+                    "attempts": attempt + 1,
+                    "file_size_mb": round(file_size / 1048576, 2),
+                    "duration_s": round(elapsed, 1),
+                    "avg_speed_mbps": round(speed, 2),
+                })
+                flush_tracing()
+                return True, None
 
-    langfuse.update_current_span(output={"success": False, "error": "max retries exceeded", "attempts": max_retries})
-    flush_tracing()
-    return False, "max retries exceeded"
+            except requests.exceptions.RequestException as e:
+                action = "retry" if attempt < max_retries - 1 else "give_up"
+                attempt_obs.update(output={"error": str(e), "action": action}, level="ERROR", status_message=str(e))
+                attempt_cm.__exit__(None, None, None)
+                flush_tracing()
+                if attempt < max_retries - 1:
+                    wait = min(5 * 2**attempt, 120)
+                    print(
+                        f"  [{source}] Download error "
+                        f"(attempt {attempt + 1}/{max_retries}): {e}, "
+                        f"retrying in {wait}s..."
+                    )
+                    time.sleep(wait)
+                else:
+                    file_obs.update(output={"success": False, "error": str(e), "attempts": attempt + 1})
+                    flush_tracing()
+                    return False, str(e)
+
+        file_obs.update(output={"success": False, "error": "max retries exceeded", "attempts": max_retries})
+        flush_tracing()
+        return False, "max retries exceeded"
+
+    finally:
+        file_cm.__exit__(None, None, None)
+        flush_tracing()
 
 
 # ---------------------------------------------------------------------------
