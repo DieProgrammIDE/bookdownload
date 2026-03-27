@@ -18,12 +18,15 @@ FORMAT_RE = re.compile(r"(?i)\b(EPUB|PDF|MOBI|AZW3|AZW|DJVU|CBZ|CBR|FB2|DOCX?|TX
 SIZE_RE = re.compile(r"\d+\.?\d*\s*(MB|KB|GB|TB)", re.IGNORECASE)
 
 
+COUNTDOWN_RE = re.compile(r"let waitSeconds\s*=\s*(\d+)")
+
+
 class AnnasArchiveSource:
-    SERVERS = [5, 6, 7, 8]
+    SERVERS = [0, 1, 2, 3, 4, 5, 6, 7]
 
     def __init__(self, base_url: str = "annas-archive.gl"):
         self._base = base_url
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="annas")
+        self._executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="annas")
         self._pw = None
         self._browser = None
         self._server_cycle = itertools.cycle(self.SERVERS)
@@ -235,7 +238,12 @@ class AnnasArchiveSource:
 
     @observe(name="extract-try-server", capture_input=False, capture_output=False)
     def _try_server(self, md5_hash: str, server_id: int) -> str | None:
-        """Visit slow_download page, wait for DDoS-Guard, extract direct URL."""
+        """Visit slow_download page, wait for DDoS-Guard, extract direct URL.
+
+        Handles two cases:
+        - Immediate URL: servers that give download link right away (~6s)
+        - Countdown timer: servers that require ~50-60s wait before link appears
+        """
         langfuse = get_client()
         langfuse.update_current_span(
             input={"md5_hash": md5_hash, "server_id": server_id},
@@ -270,14 +278,59 @@ class AnnasArchiveSource:
                 flush_tracing()
                 return None
 
+            # Check for immediate download URL
             match = url_re.search(html)
             if match:
                 result_url = match.group(0)
                 langfuse.update_current_span(
-                    output={"success": True, "url": result_url},
+                    output={"success": True, "url": result_url, "had_countdown": False},
                 )
                 flush_tracing()
                 return result_url
+
+            # Check for countdown timer — page reloads itself when timer expires
+            countdown_match = COUNTDOWN_RE.search(html)
+            if countdown_match:
+                wait_seconds = int(countdown_match.group(1))
+                print(
+                    f"  [Anna's Archive] Server {server_id}: "
+                    f"countdown {wait_seconds}s, waiting..."
+                )
+                # Wait for the JS timer to expire and trigger page reload,
+                # plus buffer for DDoS-Guard on the reloaded page
+                time.sleep(wait_seconds + 10)
+
+                # After reload, poll for DDoS-Guard again
+                for _ in range(15):
+                    time.sleep(1)
+                    try:
+                        if page.title() != "DDoS-Guard":
+                            time.sleep(2)
+                            break
+                    except Exception:
+                        continue
+
+                html = page.content()
+                match = url_re.search(html)
+                if match:
+                    result_url = match.group(0)
+                    print(
+                        f"  [Anna's Archive] Server {server_id}: "
+                        f"got URL after countdown"
+                    )
+                    langfuse.update_current_span(
+                        output={"success": True, "url": result_url, "had_countdown": True, "wait_seconds": wait_seconds},
+                    )
+                    flush_tracing()
+                    return result_url
+
+                langfuse.update_current_span(
+                    output={"success": False, "reason": "no URL after countdown", "wait_seconds": wait_seconds},
+                    level="WARNING",
+                    status_message="no URL after countdown",
+                )
+                flush_tracing()
+                return None
 
             langfuse.update_current_span(
                 output={"success": False, "reason": "no URL match in HTML"},
