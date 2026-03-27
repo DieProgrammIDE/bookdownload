@@ -26,7 +26,7 @@ class AnnasArchiveSource:
 
     def __init__(self, base_url: str = "annas-archive.gl"):
         self._base = base_url
-        self._executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="annas")
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="annas")
         self._pw = None
         self._browser = None
         self._server_cycle = itertools.cycle(self.SERVERS)
