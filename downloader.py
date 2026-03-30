@@ -77,11 +77,14 @@ def download_file(
     download_start = time.time()
 
     try:
-        for attempt in range(max_retries):
+        attempt = 0
+        error_attempts = 0  # non-429 error count, bounded by max_retries
+        while True:
+            attempt += 1
             attempt_cm = langfuse.start_as_current_observation(
                 as_type="span",
-                name=f"download-attempt-{attempt + 1}",
-                input={"attempt": attempt + 1, "max_retries": max_retries},
+                name=f"download-attempt-{attempt}",
+                input={"attempt": attempt, "max_retries": max_retries},
             )
             attempt_obs = attempt_cm.__enter__()
             flush_tracing()
@@ -103,16 +106,17 @@ def download_file(
                     )
                     attempt_cm.__exit__(None, None, None)
                     flush_tracing()
-                    file_obs.update(output={"success": False, "error": error, "attempts": attempt + 1})
+                    file_obs.update(output={"success": False, "error": error, "attempts": attempt})
                     flush_tracing()
                     return False, error
 
+                # Rate limited — always retry (no max), still count attempts
                 if resp.status_code in (429, 503):
                     wait = min(30 * 2**attempt, 300)
                     msg = f"Rate limited ({resp.status_code}), waiting {wait}s"
                     print(
                         f"  [{source}] {msg} "
-                        f"(attempt {attempt + 1}/{max_retries})..."
+                        f"(attempt {attempt})..."
                     )
                     attempt_obs.update(
                         output={"status_code": resp.status_code, "action": "rate_limited", "wait_s": wait},
@@ -175,7 +179,7 @@ def download_file(
                     )
                     attempt_cm.__exit__(None, None, None)
                     flush_tracing()
-                    file_obs.update(output={"success": False, "error": "downloaded file is empty", "attempts": attempt + 1})
+                    file_obs.update(output={"success": False, "error": "downloaded file is empty", "attempts": attempt})
                     flush_tracing()
                     return False, "downloaded file is empty"
 
@@ -191,7 +195,7 @@ def download_file(
                         )
                         attempt_cm.__exit__(None, None, None)
                         flush_tracing()
-                        file_obs.update(output={"success": False, "error": err, "attempts": attempt + 1})
+                        file_obs.update(output={"success": False, "error": err, "attempts": attempt})
                         flush_tracing()
                         return False, err
 
@@ -207,7 +211,7 @@ def download_file(
                 speed = (file_size / 1048576) / elapsed if elapsed > 0 else 0
                 file_obs.update(output={
                     "success": True,
-                    "attempts": attempt + 1,
+                    "attempts": attempt,
                     "file_size_mb": round(file_size / 1048576, 2),
                     "duration_s": round(elapsed, 1),
                     "avg_speed_mbps": round(speed, 2),
@@ -217,6 +221,7 @@ def download_file(
 
             except requests.exceptions.RequestException as e:
                 error_str = str(e)
+                error_attempts += 1
 
                 # IncompleteRead — bail immediately, caller will rotate server
                 if "IncompleteRead" in error_str:
@@ -228,32 +233,26 @@ def download_file(
                     )
                     attempt_cm.__exit__(None, None, None)
                     flush_tracing()
-                    file_obs.update(output={"success": False, "error": error_str, "attempts": attempt + 1})
+                    file_obs.update(output={"success": False, "error": error_str, "attempts": attempt})
                     flush_tracing()
                     return False, error_str
 
-                action = "retry" if attempt < max_retries - 1 else "give_up"
+                action = "retry" if error_attempts < max_retries else "give_up"
                 attempt_obs.update(output={"error": error_str, "action": action}, level="ERROR", status_message=error_str)
                 attempt_cm.__exit__(None, None, None)
                 flush_tracing()
-                if attempt < max_retries - 1:
-                    wait = min(5 * 2**attempt, 120)
+                if error_attempts < max_retries:
+                    wait = min(5 * 2**error_attempts, 120)
                     print(
                         f"  [{source}] Download error "
-                        f"(attempt {attempt + 1}/{max_retries}): {e}, "
+                        f"(attempt {attempt}, error {error_attempts}/{max_retries}): {e}, "
                         f"retrying in {wait}s..."
                     )
                     time.sleep(wait)
                 else:
-                    file_obs.update(output={"success": False, "error": error_str, "attempts": attempt + 1})
+                    file_obs.update(output={"success": False, "error": error_str, "attempts": attempt})
                     flush_tracing()
                     return False, error_str
-
-        file_obs.update(output={
-            "success": False, "error": "max retries exceeded", "attempts": max_retries,
-        })
-        flush_tracing()
-        return False, "max retries exceeded"
 
     finally:
         file_cm.__exit__(None, None, None)
